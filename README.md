@@ -3,7 +3,7 @@
 # mini-langgraph：用 600 行看懂 LangGraph 的内核
 
 > 读源码前先读这份。它把 LangGraph 拆成 5 个可以独立理解的概念，
-> 每个概念都对应 `minigraph/graph.py` 里的一段实现。
+> 每个概念都对应 `minigraph/` 包内对应模块的一段实现。
 
 ---
 
@@ -191,15 +191,15 @@ checkpoint: values 不含 fetch_data 的写入, tasks = [fetch_data, human_revie
 
 | 概念 | LangGraph | minigraph | 文件位置 |
 | --- | --- | --- | --- |
-| 状态声明 | `Annotation.Root` | `class S(State)` + `Annotated` | graph.py §1 |
-| 图构建 | `StateGraph(S)` | 同名 | graph.py §4 |
-| 条件边 | `add_conditional_edges` | 同名 | graph.py §4 |
-| 动态路由 | `Command(goto=...)` | 同名 | graph.py §2 |
-| 并行扇出 | `Send(node, arg)` | 同名 | graph.py §2 |
-| 人工中断 | `interrupt()` | 同名 | graph.py §2 |
-| 持久化 | `InMemorySaver` / `SqliteSaver` | `InMemorySaver` | graph.py §3 |
-| 执行内核 | Pregel loop | `CompiledGraph._run` | graph.py §5 |
-| 流式输出 | `stream(stream_mode=...)` | `stream()` → `(node, step, update)` | graph.py §5 |
+| 状态声明 | `Annotation.Root` | `class S(State)` + `Annotated` | `state.py` |
+| 图构建 | `StateGraph(S)` | 同名 | `builder.py` |
+| 条件边 | `add_conditional_edges` | 同名 | `builder.py` |
+| 动态路由 | `Command(goto=...)` | 同名 | `control.py` |
+| 并行扇出 | `Send(node, arg)` | 同名 | `control.py` |
+| 人工中断 | `interrupt()` | 同名 | `context.py` |
+| 持久化 | `InMemorySaver` / `SqliteSaver` | `InMemorySaver` | `checkpoint.py` |
+| 执行内核 | Pregel loop | `CompiledGraph._run` | `runtime.py` |
+| 流式输出 | `stream(stream_mode=...)` | `stream()` → `(node, step, update)` | `runtime.py` |
 
 ---
 
@@ -221,13 +221,13 @@ checkpoint: values 不含 fetch_data 的写入, tasks = [fetch_data, human_revie
 
 1. **先跑起来**：`python examples/01_react_agent.py`
 看 `agent → tools → agent → END` 这 3 个超步怎么走。
-2. **看内核**：读 `CompiledGraph._run`（约 90 行）。
+2. **看内核**：读 `minigraph/runtime.py` 的 `CompiledGraph._run`（约 90 行）。
 重点看 `snapshot` 的创建位置和 `_merge_writes` 的调用位置。
-3. **看并行**：读 `_execute_batch` + `_dedupe_tasks` + `_merge_writes`。
+3. **看并行**：读 `_execute_batch` + `_dedupe_tasks` + `_merge_writes`（同在 `runtime.py`）。
 理解"并行写冲突为什么报错"。
-4. **看中断**：跑 `examples/02_hitl_and_fanout.py`，然后读 `interrupt()`
-的实现（只有 10 行）和挂起检查点的构造。
-5. **最后看构建 API**：`StateGraph` 那段几乎全是参数校验，扫一眼即可。
+4. **看中断**：跑 `examples/02_hitl_and_fanout.py`，然后读 `minigraph/context.py` 里
+`interrupt()` 的实现（只有 10 行）和 `runtime.py` 里挂起检查点的构造。
+5. **最后看构建 API**：`minigraph/builder.py` 里 `StateGraph` 那段几乎全是参数校验，扫一眼即可。
 
 ---
 

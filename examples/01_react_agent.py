@@ -21,7 +21,10 @@
 import operator
 from typing import Annotated
 
-from minigraph.graph import END, START, InMemorySaver, State, StateGraph, add_messages
+from minigraph.builder import StateGraph
+from minigraph.checkpoint import InMemorySaver
+from minigraph.constants import END, START
+from minigraph.state import State, add_messages
 
 # ---------------------------------------------------------------- 假工具
 WEATHER = {"北京": "晴 18°C", "上海": "小雨 22°C"}
