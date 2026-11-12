@@ -24,7 +24,7 @@ LAST_VALUE: Reducer = lambda old, new: new
 # 消息列表 reducer：按 id 追加/更新，语义对齐 langgraph 的 add_messages。
 #
 # 什么时候调用：
-#   每个超步结束后由 runtime._merge_writes 调用。
+#   每个超步结束后，由 runtime._apply_writes 交给 BinaryOperatorAggregate 调用。
 #   节点若在 messages 字段上写了 N 条新消息，会逐条进入这里合并。
 #   同超步里多个节点各写各的消息也会被合并在一起。
 #
@@ -56,7 +56,7 @@ def add_messages(old, new):
 # Dict 浅合并 reducer。
 #
 # 什么时候调用：
-#   与 add_messages 同：被 _merge_writes 在合并阶段调用。
+#   与 add_messages 同：由 BinaryOperatorAggregate 在合并阶段调用。
 #   典型场景——多个并行节点各写一个 dict 字段的不同子键
 #   （{"meta": {"a": 1}} 与 {"meta": {"b": 2}}），需要在字段层把它们的
 #   子键并集起来。
@@ -144,7 +144,7 @@ def _extract_reducer(ann) -> Reducer | None:
 #     - State 子类：从 cls.schema()（也就是 __init_subclass__ 算出来的
 #       reducers）读出来
 #     - 裸 dict {field: reducer}：函数式声明，最轻
-#   内部统一收敛到 dict 形态，下游（_merge_writes / _apply）就只面对一种
+#   内部统一收敛到 dict 形态，下游（runtime._apply_writes）就只面对一种
 #   数据结构，避免在热路径里反复 isinstance / issubclass。
 def _schema(obj: Mapping[str, Reducer] | type[State] | None) -> dict[str, Reducer]:
     if obj is None:

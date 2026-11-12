@@ -1,189 +1,255 @@
-# README
+# mini-langgraph：用一张通道网络看懂 LangGraph 的内核
 
-# mini-langgraph：用 600 行看懂 LangGraph 的内核
-
-> 读源码前先读这份。它把 LangGraph 拆成 5 个可以独立理解的概念，
-> 每个概念都对应 `minigraph/` 包内对应模块的一段实现。
+> 读源码前先读这份。它把 LangGraph 拆成 6 个可以独立理解的概念，
+> 每个概念都对应 `minigraph/` 包内的一段实现，并有真实 LangGraph 差分测试兜底。
 
 ---
 
 ## 一句话结论
 
-**LangGraph 不是"工作流引擎"，而是一个带 reducer 的状态机跑批器。**
+**LangGraph 不是“按边查下一跳”的工作流引擎，而是一个由 channel 版本驱动的 Pregel 状态机。**
 
-节点是无状态函数，状态只有一份，每个超步（superstep）里：
-**并发执行 → 收齐增量 → 用 reducer 合并 → 决定下一步**。
-所谓 checkpoint、人工审批、时间旅行，全部是这个循环的副产品。
+- **边不是数据结构，是一次 channel 写入**：`add_edge("a", "b")` 编译成
+  `a` 写 `branch:to:b`，`b` 订阅这个通道。
+- **触发不是看图，是看通道版本**：通道版本超过节点上次看到的水位线，节点才被唤醒。
+- 每个超步只做：**找出变化通道的订阅者 → 并发执行 → 收齐写入 → 合并并推进版本**。
+
+checkpoint、人工审批、时间旅行，都是这套循环加上持久化后的副产品。
 
 ---
 
-## 1. 状态与 reducer：LangGraph 最反直觉的设计
+## 1. 编译期：图如何变成通道网络
 
-大多数"Agent 框架"让你直接改共享状态。LangGraph 不这么干：
+`StateGraph.compile()` 不再把边列表交给调度器，而是调用 `builder._compile()`，
+产出通道表、节点规格，以及 `channel → subscribers` 反向索引。
+
+```text
+add_edge("a", "b")
+    a.writers  += ["branch:to:b"]
+    b.triggers += ["branch:to:b"]
+
+add_edge(["a", "b"], "join")
+    channels["join:a+b:join"] = NamedBarrierValue({"a", "b"})
+    a.writers += ["join:a+b:join"]     # 写入自己的名字："a 到了"
+    b.writers += ["join:a+b:join"]
+    join.triggers += ["join:a+b:join"]
+```
+
+通道分两类，不能混为一谈：
+
+| 类型 | 例子 | 作用 |
+| --- | --- | --- |
+| **数据通道** | `messages`、`total` | 保存状态字段，供节点读取；不是触发源 |
+| **触发通道** | `branch:to:b`、`join:a+b:c` | 承载“该醒了”的信号；值通常不重要，版本才重要 |
+
+`CompiledGraph.trigger_to_nodes` 是反向索引。每轮只需检查上一轮变化通道的订阅者，
+不必扫描所有节点。对应实现：`minigraph/builder.py`、`minigraph/channels.py`。
+
+---
+
+## 2. 触发：版本号与水位线
+
+运行时每节点都有一份水位线：
+
+```python
+channel_versions["branch:to:b"] = 7
+versions_seen["b"]["branch:to:b"] = 5
+```
+
+节点 `b` 该执行，当且仅当它订阅的某个通道满足：
+
+```python
+channels[chan].is_available() and channel_versions[chan] > versions_seen[node][chan]
+```
+
+超步的核心结构是：
+
+```python
+tasks = _prepare_next_tasks(...)       # changed channels -> subscribers -> tasks
+snapshot = _read_state(...)            # 全批节点看到同一份状态
+results = _execute_batch(...)          # 单步内并发
+
+# 先记录节点执行前看到的版本，再应用本步写入
+versions_seen[node][chan] = channel_versions[chan]
+updated_channels = _apply_writes(...)  # reducer 合并 + 推进版本
+```
+
+**“先记水位、再应用写入”是回边能转起来的关键。**如果顺序反过来，
+节点写 `branch:to:自己` 后又把水位线推到新版本，自己的触发信号就被自己抹掉了，
+循环会停在一轮。
+
+分支通道使用 `EphemeralValue`：它只活一个超步，下一步没被重写就通过
+`update([])` 自清。`Send` 则写入 `__pregel_tasks`（`Topic`），走 PUSH 任务轨；
+PUSH 不会推进目标节点 `branch:to:X` 的水位线。
+
+---
+
+## 3. 状态与 reducer：增量为什么可以并行合并
 
 ```python
 class S(State):
-    messages: Annotated[list, add_messages]   # 追加，按 id 去重
+    messages: Annotated[list, add_messages]   # 按 id 追加/覆盖
     total:    Annotated[int, operator.add]    # 累加
-    query:    str                             # 缺省：last-write-wins
+    query:    str                             # last-write-wins
 ```
 
-节点返回的**不是新状态，是增量**：
+节点返回的不是新状态，而是增量：
 
 ```python
-def node(state): return {"total": 1}   # 不是 {"total": state["total"] + 1}
+def node(state):
+    return {"total": 1}      # 不是 {"total": state["total"] + 1}
 ```
 
-为什么这么设计？因为**只有增量才能被并行合并**。如果节点读到 `total=5`
-再写回 `total=6`，另一个并发节点也写入 `6`，最后结果就是 6 而不是 7——
-这就是经典的 lost update。
+如果节点读到 `total=5` 再写回 `total=6`，另一个并发节点也写回 `6`，
+最后就是 6 而不是 7——经典 lost update。返回增量后，框架才能在超步末尾统一合并。
 
-> 所以 LangGraph 里，同一超步两个并行节点写同一个"无 reducer 字段"会**直接报错**。
-> 这不是 bug，是它在强迫你表态：你要的到底是覆盖、累加，还是去重合并？
-> （对应实现：`_merge_writes`）
+字段到数据通道的映射很直接：
 
-**这是整个框架最重要的认知转变：从"共享内存"转向"增量 + 合并函数"。**
-
----
-
-## 2. 超步调度：Pregel / BSP 模型
-
-LangGraph 的执行模型抄自 Google 的 Pregel（图计算）和 BSP（Bulk Synchronous Parallel）。
-
-```
-超步 1:  [node_a] ──────┐
-                        ├─→ 合并写入 → 重算状态
-超步 2:  [node_b] [node_c] ─┐   ← 并行（线程池）
-                        ├─→ 合并写入 → 重算状态
-超步 3:  [node_d] ──────┘
-```
-
-三个必须记住的性质：
-
-| 性质 | 含义 | 对应代码 |
+| 字段声明 | 通道 | 并发写入语义 |
 | --- | --- | --- |
-| **同步屏障** | 同一超步里的节点看到的是**同一份状态快照**，谁也别想读到别人的输出 | `snapshot = dict(values)` |
-| **批量提交** | 所有写入在这一步末尾**一次性** reduce 进状态 | `_merge_writes` |
-| **顺序无关** | reducer 决定合并语义，所以并发执行不会影响结果 | 用 `operator.add` 而非 `+` |
+| 无 reducer / `LAST_VALUE` | `LastValue` | 同一步多个值直接报错 |
+| 有二元 reducer | `BinaryOperatorAggregate` | 逐个 fold：`value = reducer(value, update)` |
 
-**循环 = 回边。** ReAct Agent 的 `tools → agent` 就是一条回边，不需要
-`while not done` 这种宿主代码——循环次数由 `recursion_limit` 兜底。
+`add_messages` 和 `merge_dict` 也是二元 reducer，所以不需要特殊通道。
+并发写冲突由 `LastValue.update()` 抛出 `ConcurrentWriteError`，
+对应真实 LangGraph 的 `InvalidUpdateError`。
 
 ---
 
-## 3. 路由：三种方式，别混用
+## 4. 路由与汇聚：三个容易混淆的语义
 
-### 3.1 静态边 `add_edge("a", "b")`
-
-最简单，`a` 跑完就跑 `b`。
-
-### 3.2 条件边 `add_conditional_edges`
-
-路由函数**只读状态、不做副作用**，返回 key：
+### 4.1 静态边与条件边
 
 ```python
+g.add_edge("a", "b")
 g.add_conditional_edges("agent", should_continue,
                         {"tools": "tools", END: END})
 ```
 
-### 3.3 `Command`：节点自己决定去哪
+条件边看到的是“本节点写入**经过 reducer 合并后**的状态”，不是原始增量。
+例如节点写 `{"n": 1}` 且 reducer 是 `operator.add`，路由函数看到的是 `old + 1`。
 
-当"下一步"依赖节点**内部**的复杂判断时，用 `Command` 把
-"更新状态"和"路由"合并成一个返回值：
+### 4.2 `Command(goto=...)`
 
 ```python
 def node(state):
     return Command(goto="retry" if err else "done", update={"attempts": 1})
 ```
 
-> **实践建议**：能用条件边就别用 `Command`。`Command` 的问题是它让图结构
-> 变得不可静态分析——你看 `add_conditional_edges` 一眼就知道有哪些分支，
-> 看 `Command` 得去翻每个节点的函数体。
+`goto` 编译为一次 `branch:to:<target>` 写入。**它不会抑制节点原有的静态边和条件边**；
+若同时存在，静态目标和 `goto` 目标都会被触发。
+
+### 4.3 两条入边不等于屏障
+
+这是最容易凭直觉写错的地方：
+
+```python
+g.add_edge("a", "c")
+g.add_edge("b", "c")
+```
+
+- `a`、`b` 在**同一超步**写入 `branch:to:c`：版本只推进一步，`c` 跑一次。
+- `a`、`b` 在**不同超步**写入：`c` 会被触发两次。
+
+要表达“等 a 和 b 都完成，再跑一次 c”，必须显式使用屏障边：
+
+```python
+g.add_edge(["a", "b"], "c")     # NamedBarrierValue；c 消费后屏障重新武装
+```
 
 ---
 
-## 4. 扇出（Send）：动态并行
-
-条件边只能走"预定义的分支"，但 map-reduce 需要**运行时才知道有几个任务**：
+## 5. `Send`：动态 PUSH 任务
 
 ```python
 def dispatch(state):
     return [Send("worker", {"topic": t}) for t in state["topics"]]
 ```
 
-`Send` 的本质：**在超步末尾动态生成 N 个任务**，下一超步并发执行。
-每个 `Send` 携带独立 `arg`，但写回的是同一个状态——所以 worker 的产出
-必须落在带 reducer 的字段上（通常是 `Annotated[list, operator.add]`）。
+每个 `Send` 写入 `__pregel_tasks`，下一超步变成一个 PUSH 任务，同批并发执行。
+worker 的产出应写入带 reducer 的字段，例如 `Annotated[list, operator.add]`。
 
-> 这是 LangGraph 做 subagent / 并行研究 / 批量评测的标准姿势。
-> 坑：`Send` 的任务不会自动"汇合"回一个节点，需要显式加一条
-> `add_edge("worker", "aggregator")`；多条分支指向同一节点时框架会去重
-> （对应 `_dedupe_tasks`），这就是 join 语义。
+多个 worker 同时写 `branch:to:aggregator` 时，若它们在同一超步完成，
+aggregator 下一超步只触发一次。若完成时间落在不同超步，则可能触发多次；
+需要严格“全部到齐后一次”的语义时，使用屏障边。
 
 ---
 
-## 5. 检查点与 interrupt：断点续跑的全部秘密
+## 6. checkpoint 与 interrupt
 
-`InMemorySaver` 存的东西极其朴素——**每个超步一个快照**：
+通道模型下，一个 checkpoint 不只保存状态值，还保存恢复调度所需的版本信息：
 
 ```python
-@dataclass
-class Checkpoint:
-    step: int
-    values: dict          # 这一步结束时的完整状态
-    tasks: list           # 下一步要跑谁（含 Send 的 arg）
-    interrupt: dict|None  # 当前是否悬在某个中断点上
+Checkpoint(
+    step=...,
+    values=...,                 # 用户可见的状态投影（不含 branch:to:*）
+    channel_values=...,         # 每个通道的快照
+    channel_versions=...,       # 通道版本
+    versions_seen=...,          # 每节点水位线
+    next=..., tasks=...,
+    interrupt=...,
+)
 ```
 
-有了这个，三件事就免费了：
+因此恢复时不需要重新“查边列表”：重建通道后，`_prepare_next_tasks`
+会根据版本与水位线重新算出该执行的任务。
 
-### 5.1 人工审批
+### 6.1 人工审批
 
 ```python
 def review(state):
-    decision = interrupt({"draft": state["draft"]})   # 冻结
+    decision = interrupt({"draft": state["draft"]})
     return {"status": decision}
 ```
 
-恢复：`app.invoke(None, {"thread_id": tid, "resume": {"action": "approve"}})`
+恢复：`app.invoke(None, {"thread_id": tid, "resume": {"action": "approve"}})`。
+resume 槽位包含节点名、超步号、PULL/PUSH 类型和组内序号，保证循环或扇出中
+同一节点多次挂起时不会拿错值。
 
-**关键细节（也是自己实现最容易踩的坑）**：恢复时从"挂起点"重跑该节点，
-而 `interrupt()` 第二次执行必须能取到 resume 值。所以需要一个**稳定且唯一**
-的槽位标识。mini 版用 `节点名@步号#批内序号`；如果你用 `节点名` 当 key，
-节点在循环里第二次挂起就会取到上一个值（这个 bug 我在实现时真踩了，
-见 `test_interrupt_can_fire_multiple_times_in_a_loop`）。
+### 6.2 时间旅行
 
-### 5.2 时间旅行
+`get_state_history()` 取历史快照，`update_state(..., as_node=...)` 改写状态并
+写入 `branch:to:<as_node>`，从而指定分叉后先执行哪个节点。
 
-`get_state_history()` 拿到所有快照 → `update_state(..., as_node=...)` 从任意点
-改写并分叉重跑。这不是什么高级特性，就是"多存了几份 dict"。
+### 6.3 minigraph 的挂起策略：整步回滚
 
-### 5.3 崩溃恢复
+minigraph 中，同一超步只要有节点调用 `interrupt()`，本步所有写入都不提交，
+恢复后整批重跑。节点因此必须幂等。
 
-进程挂了，checkpoint 还在（生产上用 Postgres/SQLite saver），
-下次 `invoke(None, thread_id)` 直接接着跑。
+**这是 minigraph 有意的教学简化，不应误写成真实 LangGraph 的唯一实现。**
+实测 LangGraph 1.2.16 会保留已完成兄弟任务的结果、只重跑未完成任务；
+在标准测试场景中两者最终状态一致，但节点副作用次数不同。
 
-> 注意：LangGraph 的 checkpoint 是**超步级**的，不是**节点级**的。
-> 一个超步里跑了 3 个节点，崩了要重跑这 3 个。所以节点要做到幂等。
+---
 
-### 5.4 一个容易忽略的语义：挂起 = 整步回滚
+## 与真实 LangGraph 的已知差异
 
-如果同一个超步里既有普通节点、又有节点调用了 `interrupt()`，那么**这一步的
-****所有写入都会被丢弃**，恢复后整批重跑：
+| 行为 | minigraph | LangGraph 1.2.16 |
+| --- | --- | --- |
+| 节点直接返回 `list[Send]` | 支持，并抑制该节点的静态/条件边 | 抛 `InvalidUpdateError`；请从条件边或 `Command` 发出 |
+| 节点返回 `{"field": None}` | 视作 no-op，不写通道 | 将 `None` 写入通道 |
+| PUSH 节点输入 | `Send.arg` 合并到状态快照，另附 `__state__` | 只传 `Send.arg` |
+| interrupt 并行批 | 整步回滚、整批重跑 | 保留已完成任务结果，重跑未完成任务 |
+| 并发写错误类型 | `ConcurrentWriteError(RuntimeError)` | `InvalidUpdateError` |
 
+这些差异均有注释或测试标注；其余核心调度行为通过差分场景验证。
+
+---
+
+## 验证
+
+```bash
+# 单元与通道回归测试
+.venv/bin/python -m pytest tests/ -q
+
+# 与真实 LangGraph 做同进程差分；解释器需同时能 import langgraph 和本仓库
+python tests/difflang/run.py
 ```
-超步 3:  [fetch_data ✓]  [human_review → interrupt]
-          ↓ 本步作废
-checkpoint: values 不含 fetch_data 的写入, tasks = [fetch_data, human_review]
-恢复后:  两个节点都重新执行
-```
 
-这不是实现偷懒，而是 BSP 屏障的必然结果——"一步要么全提交，要么全不提交"。
-它直接推导出 LangGraph 反复强调的那条铁律：**节点必须幂等**。
-
-（我实现时先后写错了三次才想明白：最初只重跑挂起节点 → 后面的任务丢失；
-改成全批重跑但保留已完成写入 → `operator.add` 字段被重复累加。正确解法是
-"挂起时整步不提交"，见 `test_interrupt_inside_parallel_batch_rolls_back_the_superstep`。）
+当前包含 30 个单元/回归测试和 14 个差分场景。差分比较：
+每超步节点集合、超步总数、最终状态；失败场景还会直接插桩比较报错前的节点调用次数。
+注意真实 LangGraph 的 `stream_mode="updates"` 是**按任务**产出，不是按超步；
+harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。
 
 ---
 
@@ -191,53 +257,32 @@ checkpoint: values 不含 fetch_data 的写入, tasks = [fetch_data, human_revie
 
 | 概念 | LangGraph | minigraph | 文件位置 |
 | --- | --- | --- | --- |
-| 状态声明 | `Annotation.Root` | `class S(State)` + `Annotated` | `state.py` |
-| 图构建 | `StateGraph(S)` | 同名 | `builder.py` |
+| 状态声明 | TypedDict + `Annotated` | `class S(State)` + `Annotated` | `state.py` |
+| 通道 | `BaseChannel` 及各实现 | 同名精简实现 | `channels.py` |
+| 图编译 | `attach_node/edge/branch` | `StateGraph._compile` | `builder.py` |
 | 条件边 | `add_conditional_edges` | 同名 | `builder.py` |
 | 动态路由 | `Command(goto=...)` | 同名 | `control.py` |
 | 并行扇出 | `Send(node, arg)` | 同名 | `control.py` |
 | 人工中断 | `interrupt()` | 同名 | `context.py` |
-| 持久化 | `InMemorySaver` / `SqliteSaver` | `InMemorySaver` | `checkpoint.py` |
+| 持久化 | `InMemorySaver` 等 | `InMemorySaver` | `checkpoint.py` |
 | 执行内核 | Pregel loop | `CompiledGraph._run` | `runtime.py` |
-| 流式输出 | `stream(stream_mode=...)` | `stream()` → `(node, step, update)` | `runtime.py` |
+| 触发判定 | `prepare_next_tasks/_triggers` | 同名精简实现 | `runtime.py` |
 
 ---
 
-## 被砍掉的部分（以及为什么可以砍）
+## 推荐阅读顺序
 
-| 特性 | 为什么 mini 版不做 |
-| --- | --- |
-| `stream_mode="messages"` 等 | LLM token 级流式，纯 I/O 细节，不影响理解内核 |
-| `Subgraph` / 子图 | 本质是把一个 `CompiledGraph` 当节点，机制完全复用 |
-| `checkpoint_ns` | 为子图服务；单层图不需要 |
-| `PostgresSaver` | 只是把 `dict` 换成 SQL，`put/get/list` 接口不变 |
-| `durability` / `cache` | 性能优化，不改变语义 |
-| 异步 (`ainvoke`) | `asyncio` 版的事件循环，结构完全对称 |
-| `RetryPolicy` 全参数 | 保留了核心的重试 + 指数退避 |
+1. 跑 `python examples/01_react_agent.py`，观察 ReAct 回边。
+2. 读 `minigraph/builder.py` 的 `_compile()`：边如何变成通道写入和订阅。
+3. 读 `minigraph/channels.py`：重点看 `EphemeralValue` 与 `NamedBarrierValue`。
+4. 读 `minigraph/runtime.py` 的 `_prepare_next_tasks`、`_triggers`、`_apply_writes`，
+   最后看 `CompiledGraph._run` 如何把它们串起来。
+5. 跑 `python examples/02_hitl_and_fanout.py`，再读 checkpoint 恢复逻辑。
+6. 跑 `python tests/difflang/run.py`，对照真实 LangGraph 的执行轨迹。
 
----
+最后如果能一句话说清下面这个问题，就说明抓住了内核：
 
-## 推荐的阅读顺序
+> 为什么节点写一次 `branch:to:b`，`b` 就会醒，而写普通状态字段不会？
 
-1. **先跑起来**：`python examples/01_react_agent.py`
-看 `agent → tools → agent → END` 这 3 个超步怎么走。
-2. **看内核**：读 `minigraph/runtime.py` 的 `CompiledGraph._run`（约 90 行）。
-重点看 `snapshot` 的创建位置和 `_merge_writes` 的调用位置。
-3. **看并行**：读 `_execute_batch` + `_dedupe_tasks` + `_merge_writes`（同在 `runtime.py`）。
-理解"并行写冲突为什么报错"。
-4. **看中断**：跑 `examples/02_hitl_and_fanout.py`，然后读 `minigraph/context.py` 里
-`interrupt()` 的实现（只有 10 行）和 `runtime.py` 里挂起检查点的构造。
-5. **最后看构建 API**：`minigraph/builder.py` 里 `StateGraph` 那段几乎全是参数校验，扫一眼即可。
-
----
-
-## 一个判断标准
-
-如果你能用一句话说清下面这个问题，就说明你懂了：
-
-> 为什么 LangGraph 的节点必须返回 `dict` 而不能直接 `state["x"] = 1`？
-
-答案：因为前者是**可合并的增量**，后者是**不可合并的副作用**。
-在 BSP 模型下，副作用会让"并行执行"和"断点重跑"同时失效。
-这就是 LangGraph 相对于 LangChain 的 `AgentExecutor` 的核心差异——
-后者把循环写在 Python 的 `while` 里，状态藏在对象里，所以没法暂停、没法回放。
+答案：**前者是 b 订阅的触发通道，写入会推进通道版本并越过 b 的水位线；
+后者只是数据通道，参与状态读取，不参与节点触发。**

@@ -120,12 +120,26 @@ class StateGraph:
         return self
 
     def add_conditional_edges(
-        self, src: str, path: Callable[[State], Any], path_map: Mapping[str, str] | None = None
+        self,
+        src: str,
+        path: Callable[[State], Any],
+        path_map: Mapping[str, str] | Sequence[str] | None = None,
     ) -> "StateGraph":
-        """path 返回 key（或 key 列表 / Send），经 path_map 翻译成节点名。"""
+        """
+        path 返回 key（或 key 列表 / Send），经 path_map 翻译成节点名。
+
+        与 LangGraph 一致，path_map 既可以给 {"continue": "worker"} 这样的映射，
+        也可以给 ["worker"] 这样的列表（每个名字映射到自身）。
+        """
         if src not in self.nodes:
             raise ValueError(f"未知源节点 {src!r}")
-        self.branches.append({"source": src, "path": path, "map": dict(path_map or {})})
+        if isinstance(path_map, Mapping) or path_map is None:
+            mapping = dict(path_map or {})
+        elif isinstance(path_map, (str, bytes)):
+            raise TypeError("path_map 必须是映射或节点名列表，不能是字符串")
+        else:
+            mapping = {name: name for name in path_map}
+        self.branches.append({"source": src, "path": path, "map": mapping})
         return self
 
     def set_entry_point(self, name: str) -> "StateGraph":

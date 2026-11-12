@@ -31,5 +31,14 @@ class _Missing:
     def __repr__(self) -> str:  # pragma: no cover
         return "<missing>"
 
+    def __copy__(self) -> "_Missing":
+        return self
+
+    def __deepcopy__(self, memo: dict) -> "_Missing":
+        # 通道快照用 MISSING 表示"空"。深拷贝 checkpoint 时若复制出另一个
+        # _Missing 实例，from_checkpoint 的 `is not MISSING` 判断就会失效，
+        # 把空通道误恢复成有值通道。
+        return self
+
 
 MISSING = _Missing()

@@ -46,6 +46,22 @@ class Checkpoint:
     # "图被冻住了，必须传 config={'resume': ...} 才能继续"。
     interrupt: dict[str, Any] | None = None
 
+    # ---- 通道模型的持久化状态 ----------------------------------------
+    #
+    # values 是**扁平的状态投影**（只含状态字段，给 get_state 用）；
+    # 下面三样才是恢复执行所需的完整内核状态。
+
+    # 每个通道的当前值快照（数据通道 + 触发通道 + 屏障通道都有）。
+    channel_values: dict[str, Any] = field(default_factory=dict)
+
+    # 每个通道的版本号：channel_versions[chan]。
+    # 通道被写入一次，版本就推进一步；下游节点据此判断"我该醒了"。
+    channel_versions: dict[str, int] = field(default_factory=dict)
+
+    # 每个节点的水位线：versions_seen[node][chan] = 该节点上次看到的版本。
+    # 触发条件：channel_versions[chan] > versions_seen[node][chan]。
+    versions_seen: dict[str, dict[str, int]] = field(default_factory=dict)
+
     def copy(self) -> "Checkpoint":
         import copy as _c
 
@@ -53,6 +69,9 @@ class Checkpoint:
             id=self.id, step=self.step, values=_c.deepcopy(self.values),
             next=tuple(self.next), tasks=_c.deepcopy(self.tasks),
             interrupt=_c.deepcopy(self.interrupt),
+            channel_values=_c.deepcopy(self.channel_values),
+            channel_versions=_c.deepcopy(self.channel_versions),
+            versions_seen=_c.deepcopy(self.versions_seen),
         )
 
 

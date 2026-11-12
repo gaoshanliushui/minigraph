@@ -40,6 +40,7 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Sequence
 
 from .constants import MISSING, Reducer
+from .state import LAST_VALUE
 
 
 class EmptyChannelError(Exception):
@@ -410,7 +411,12 @@ def channel_for_field(field: str, reducer: Reducer | None) -> BaseChannel:
 
     add_messages / merge_dict 本来就是 (old, new) -> merged 的二元 reducer，
     所以它们自动落进 BinaryOperatorAggregate，**不需要特殊处理**。
+
+    注意 LAST_VALUE：State.__init_subclass__ 会把「没写 Annotated」的字段
+    也登记成 reducers[field] = LAST_VALUE（而不是 None）。LAST_VALUE 本身
+    就是"后写覆盖"，语义上等同于"没有 reducer"，所以要归到 LastValue 通道 ——
+    它能在一步收到多个值时报错，而 BinaryOperatorAggregate 会静默取最后一个。
     """
-    if reducer is None:
+    if reducer is None or reducer is LAST_VALUE:
         return LastValue(field)
     return BinaryOperatorAggregate(field, reducer)
