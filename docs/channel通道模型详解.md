@@ -47,9 +47,130 @@ and versions[chan] > seen[node][chan]      # 轴二：这信号是新来的吗
 
 ---
 
-## 2. 逐类型详解
+## 2. 通道清单：一张图里到底有哪些通道
 
-### 2.0 总表
+通道不是用户写的，是**编译期自动生成**的（`builder.py:152-214`）。
+一张图的通道表 = **状态字段数 + 节点数 + 屏障边数 + 2**。
+
+以这张图为例：
+
+```python
+class S(State):
+    n:     Annotated[int, operator.add]    # 有 reducer
+    msgs:  Annotated[list, add_messages]    # 有 reducer
+    plain: str                             # 无 reducer
+
+g.add_edge(START, "a")
+g.add_edge("a", "b")
+g.add_edge("b", "c")
+g.add_edge(["b", "c"], "d")              # 屏障边
+g.add_conditional_edges("d", ...)         # 条件边
+```
+
+编译产物（`scripts/channel_inventory.py` 的真实输出）：
+
+| 通道名 | 类型 | 角色 | 谁写它 | 谁订阅它 |
+| --- | --- | --- | --- | --- |
+| `n` | `BinaryOperatorAggregate` | 数据通道（状态字段） | 节点写 `{"n": ...}` | 无（只被读） |
+| `msgs` | `BinaryOperatorAggregate` | 数据通道（状态字段） | 节点写 `{"msgs": ...}` | 无（只被读） |
+| `plain` | `LastValue` | 数据通道（状态字段） | 节点写 `{"plain": ...}` | 无（只被读） |
+| `branch:to:a` | `EphemeralValue` | 触发通道（分支信号） | `__start__` / 前驱节点 | `a` |
+| `branch:to:b` | `EphemeralValue` | 触发通道（分支信号） | `a` | `b` |
+| `branch:to:c` | `EphemeralValue` | 触发通道（分支信号） | `b` | `c` |
+| `branch:to:d` | `EphemeralValue` | 触发通道（分支信号） | 条件边（运行时决定） | `d` |
+| `__start__` | `EphemeralValue` | 触发通道（入口伪节点占位） | （没有人写） | `__start__` |
+| `join:b+c:d` | `NamedBarrierValue` | 触发通道（多源汇聚屏障） | `b` 写 `"b"`、`c` 写 `"c"` | `d` |
+| `__pregel_tasks` | `Topic` | 触发通道（PUSH 轨 / Send 队列） | 写 `Send(...)` 的节点 | 调度器 |
+
+### 2.1 数据通道（每个状态字段一个）
+
+| 通道名 | 类型 | 什么时候是这种 | 合并语义 |
+| --- | --- | --- | --- |
+| `<字段名>` | `LastValue` | 字段没写 `Annotated`，或 reducer 是 `LAST_VALUE` | last-write-wins；一步只收一个值，收多个直接报并发冲突 |
+| `<字段名>` | `BinaryOperatorAggregate` | 字段写了 `Annotated[T, reducer]` | `value = reducer(old, new)`；首次写入直接落盘 |
+
+**数据通道只被读，不触发任何人。** 它们出现在 `_read_state()` 生成的快照里，
+节点通过 `state["字段名"]` 读到值；它们**不在任何节点的 `triggers` 里**。
+
+判定规则见 `channel_for_field()`（`channels.py:406-423`）：
+
+```text
+reducer is None 或 reducer is LAST_VALUE  ->  LastValue
+其它（operator.add / add_messages / merge_dict ...） -> BinaryOperatorAggregate
+```
+
+> **坑**：`from __future__ import annotations` 会把注解变成**字符串**。
+> 如果不把字符串解析回真实类型，`Annotated[int, operator.add]` 会被当成
+> "没写 reducer" -> 字段落到 `LastValue` 而不是 `BinaryOperatorAggregate`，
+> 于是并行分支写同一字段直接报并发冲突，而不是累加。
+> `State.__init_subclass__` 里的 `_own_annotations()` 负责这件事，
+> 见《`runtime超步循环详解.md`》与 `tests/test_future_annotations.py`。
+
+### 2.2 触发通道（每个节点 / 每条屏障边 / 全局各一个）
+
+| 通道名 | 类型 | 谁写它 | 谁订阅它 | 语义 |
+| --- | --- | --- | --- | --- |
+| `branch:to:<节点>` | `EphemeralValue(guard=False)` | 前驱节点的静态边、条件边、`Command(goto=)` | 该节点 | "该跑你了" |
+| `join:<a+b>:<目标>` | `NamedBarrierValue` | 各来源节点写**自己的名字** | 目标节点 | "人都到齐了" |
+| `__pregel_tasks` | `Topic(accumulate=False)` | 写 `Send(...)` 的节点 | 调度器（PUSH 轨） | "派活单" |
+| `__start__` | `EphemeralValue` | （没有人写） | `__start__` 伪节点 | 入口占位 |
+
+几个容易忽略的点：
+
+- **每个节点都有 `branch:to:X`**，哪怕它是终端节点、哪怕没有任何边指向它。
+  通道先建好，边只决定"谁写它"。
+- **`branch:to:X` 的值永远是 `None`**，有意义的是"被写过"这个事实。
+  `guard=False` 是因为两个并行节点同时 `Command(goto="x")` 是合法的。
+- **`join:` 通道名 = `join:` + 来源用 `+` 连 + `:` + 目标**。
+  `add_edge(["a","b"], "c")` → `join:a+b:c`（`builder.py:196-205`）。
+- **一个节点可以订阅多个通道**：既有普通入边又有屏障入边时，`triggers` 里会有两个
+  （上例中 `d` 的 `triggers = ['branch:to:d', 'join:b+c:d']`）。**任一通道触发即可**。
+- **`__start__` 通道是个占位**：真正发入口信号的是 `__start__` 伪节点在开局
+  写 `branch:to:<入口>`；`__start__` 通道自己没人写，`__start__` 节点又被
+  `is_start=True` 跳过，所以它永远不产生任务。
+
+### 2.3 节点侧的订阅表
+
+```text
+a          triggers=['branch:to:a']                writers=['branch:to:b']
+b          triggers=['branch:to:b']                writers=['branch:to:c', 'join:b+c:d']
+c          triggers=['branch:to:c']                writers=['join:b+c:d']
+d          triggers=['branch:to:d', 'join:b+c:d']  writers=[]  branches=1
+__start__  triggers=['__start__']                  writers=['branch:to:a']
+```
+
+- `triggers` = 订阅了谁（能被什么唤醒）
+- `writers` = 会写谁（静态边 + 屏障边编译来的）
+- `branches` = 有几条条件边（运行时才决定写哪个 `branch:to:X`）
+
+反向索引 `trigger_to_nodes`（`runtime.py:214-218`）就是 `triggers` 的转置，
+调度时用它从"变化的通道"直接找到候选节点：
+
+```text
+branch:to:a -> ['a']
+branch:to:b -> ['b']
+branch:to:c -> ['c']
+branch:to:d -> ['d']
+join:b+c:d  -> ['d']
+__start__   -> ['__start__']
+```
+
+### 2.4 数据通道 vs 触发通道
+
+| | 数据通道 | 触发通道 |
+| --- | --- | --- |
+| 谁生成 | 每个状态字段一个 | 每个节点 / 每条屏障边 / 全局队列 |
+| 命名 | 字段名 | `branch:to:X` / `join:a+b:c` / `__pregel_tasks` |
+| 值有意义吗 | ✅ 就是状态本身 | ❌ 只有"被写过"有意义 |
+| 参与触发吗 | ❌ | ✅ |
+| 参与状态快照吗 | ✅ | ❌（且不会泄漏到 `get_state()`） |
+| 活多久 | 整个运行 | 一个超步（屏障到被消费为止） |
+
+---
+
+## 3. 逐类型详解
+
+### 3.0 总表
 
 | 通道类型 | 用在哪 | 初始 | 写之后 | `update([])` 之后 | 什么时候变回 False |
 | --- | --- | --- | --- | --- | --- |
@@ -60,9 +181,9 @@ and versions[chan] > seen[node][chan]      # 轴二：这信号是新来的吗
 | `Topic(accumulate=True)` | 通用发布订阅 | False | True | **仍 True** | 从不 |
 | `NamedBarrierValue` | `join:a+b:c` 屏障 | False | **集齐才 True** | 仍 False | `consume()` 重新武装后 |
 
-实测输出见文末 §7。
+实测输出见文末 §8。
 
-### 2.1 `LastValue`（`channels.py:166`）/ `BinaryOperatorAggregate`（`channels.py:221`）
+### 3.1 `LastValue`（`channels.py:166`）/ `BinaryOperatorAggregate`（`channels.py:221`）
 
 ```python
 def is_available(self) -> bool:
@@ -79,7 +200,7 @@ def is_available(self) -> bool:
 > `LastValue` 与 `BinaryOperatorAggregate` 的区别不在可用性，而在**合并语义**：
 > 前者一步只收一个值（收多个直接报 `ConcurrentWriteError`），后者按 reducer 累积。
 
-### 2.2 `EphemeralValue`（`channels.py:277`）—— 分支触发通道
+### 3.2 `EphemeralValue`（`channels.py:277`）—— 分支触发通道
 
 判据同上（`value is not MISSING`），但它**能被清掉**（`channels.py:257-262`）：
 
@@ -93,7 +214,7 @@ def update(self, values):
     ...
 ```
 
-**这就是"分支信号只活一个超步"的实现**（时间线见 §4）。
+**这就是"分支信号只活一个超步"的实现**（时间线见 §5）。
 
 关键点：**写进去的值是 `None`，但仍然算"可用"**。分支通道的信号不是"值"，
 而是"被写过"这个事实——所以 `is_available()` 判的是"有没有被写过"，
@@ -103,7 +224,7 @@ def update(self, values):
 > 与可用性无关。分支通道用 `guard=False`，因为两个并行节点同时
 > `Command(goto="x")` 是合法的。
 
-### 2.3 `Topic`（`channels.py:331`）—— `__pregel_tasks` Send 队列
+### 3.3 `Topic`（`channels.py:331`）—— `__pregel_tasks` Send 队列
 
 ```python
 def is_available(self) -> bool:
@@ -127,7 +248,7 @@ self.values.extend(flat)  # <- 再收本步的
 
 `accumulate=True` 时则是真发布订阅：`values` 只增不减，`update([])` 不清空。
 
-### 2.4 `NamedBarrierValue`（`channels.py:382`）—— 多源汇聚屏障
+### 3.4 `NamedBarrierValue`（`channels.py:382`）—— 多源汇聚屏障
 
 ```python
 def is_available(self) -> bool:
@@ -152,7 +273,7 @@ def is_available(self) -> bool:
    这个调用在"消费触发通道"步骤（`runtime.py:160-179`），**早于**自清步骤，
    顺序上不会打架。
 
-### 2.5 `BaseChannel` 默认实现（`channels.py:94-100`）
+### 3.5 `BaseChannel` 默认实现（`channels.py:94-100`）
 
 ```python
 def is_available(self) -> bool:
@@ -168,7 +289,7 @@ def is_available(self) -> bool:
 
 ---
 
-## 3. 三类通道的"可用期"对比
+## 4. 三类通道的"可用期"对比
 
 | | 数据通道<br>(LastValue / BinaryOp) | 触发通道<br>(EphemeralValue) | 屏障通道<br>(NamedBarrier) |
 | --- | --- | --- | --- |
@@ -180,9 +301,9 @@ def is_available(self) -> bool:
 
 ---
 
-## 4. 超步时间线
+## 5. 超步时间线
 
-### 4.1 分支通道恰好活一个超步
+### 5.1 分支通道恰好活一个超步
 
 ```
 step N 结束：A 写 branch:to:B   -> 可用=True, 版本=v
@@ -193,7 +314,7 @@ step N+2 开始：算触发            -> 可用=False -> B 不再被触发
 
 "可用"精确覆盖了"上一超步刚写、这一超步还能读到"这个窗口。
 
-### 4.2 屏障的完整生命周期
+### 5.2 屏障的完整生命周期
 
 ```
 step N   ：a、b 各自写 join:a+b:c = 自己的名字   -> seen={a,b} -> 可用
@@ -205,7 +326,7 @@ step N+2 ：若 a、b 又各写一次 -> seen={a,b} -> 又可用 -> c 再触发�
 
 ---
 
-## 5. 可用性除了触发，还管三件事
+## 6. 可用性除了触发，还管三件事
 
 **① 快照里有没有这个字段**（`runtime.py:747`）
 
@@ -235,7 +356,7 @@ if ch.is_available() and ch.update([]):
 
 ---
 
-## 6. 两个易错点
+## 7. 两个易错点
 
 **`None` 是合法值。** `LastValue` 存了 `None` → `value is not MISSING` → 可用。
 分支通道正是靠这个成立（值是 `None`，意义在"被写过"）。**`MISSING` 才是"空"。**
@@ -254,7 +375,7 @@ if ch.is_available() and ch.update([]):
 
 ---
 
-## 7. 怎么自己验
+## 8. 怎么自己验
 
 ```bash
 .venv/bin/python scripts/channel_availability.py
@@ -302,9 +423,18 @@ if ch.is_available() and ch.update([]):
 想在真实图里看通道状态，加 `config={"debug": True}`，每个超步会打印
 `versions` / `seen` / `avail` 三张表（`runtime.py:196-203`）。
 
+想看一张图**编译出了哪些通道**：
+
+```bash
+.venv/bin/python scripts/channel_inventory.py
+```
+
+它会打印通道表（含类型与角色）、每个节点的 `triggers` / `writers`、
+反向索引 `trigger_to_nodes`，以及开局时每个通道的可用性。
+
 ---
 
-## 8. 与真实 LangGraph 的对应
+## 9. 与真实 LangGraph 的对应
 
 | minigraph | LangGraph | 说明 |
 | --- | --- | --- |
@@ -323,9 +453,16 @@ LangGraph `BaseChannel` API 预留的钩子。
 
 ---
 
-## 9. 速查
+## 10. 速查
 
 ```text
+通道清单（一张图的通道表 = 状态字段数 + 节点数 + 屏障边数 + 2）
+  <字段名>            LastValue / BinaryOperatorAggregate   数据通道（只被读，不触发）
+  branch:to:<节点>    EphemeralValue(guard=False)           触发通道（分支信号）
+  join:<a+b>:<目标>   NamedBarrierValue                     触发通道（多源汇聚屏障）
+  __pregel_tasks      Topic(accumulate=False)               触发通道（Send 队列）
+  __start__           EphemeralValue                        入口伪节点占位
+
 可用性判据（按类型）
   LastValue / BinaryOperatorAggregate : value is not MISSING        —— 写过就一直有
   EphemeralValue                      : value is not MISSING        —— 写过，本超步内有效
@@ -339,4 +476,11 @@ update([]) 的含义
 
 触发判定（可用性只是其中一条）
   is_available()  AND  versions[chan] > seen[node][chan]
+```
+
+两个会静默出错的坑：
+
+```text
+Python 3.14 (PEP 649)   注解惰性化   -> 必须读 cls.__annotations__（不是 cls.__dict__）
+from __future__ import annotations   注解变字符串 -> 必须解析回真实类型，否则 reducer 全丢
 ```

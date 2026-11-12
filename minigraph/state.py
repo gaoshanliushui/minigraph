@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Mapping
 
 from .constants import MISSING, Reducer
@@ -100,7 +101,7 @@ class State(dict):
         # "__annotations__" 这一项 —— 用 __dict__ 取会拿到 None，于是 reducer
         # 静默消失（reducers 变空 -> 运行时每个字段写入都报"未声明的字段"）。
         # 两个版本下它都只含**本类自己**声明的注解（3.10+ 起不再沿 MRO 继承）。
-        for name, ann in getattr(cls, "__annotations__", {}).items():
+        for name, ann in _own_annotations(cls).items():
             if name.startswith("_") or name == "reducers":
                 continue
             reducers[name] = _extract_reducer(ann) or LAST_VALUE
@@ -109,6 +110,41 @@ class State(dict):
     @classmethod
     def schema(cls) -> dict[str, Reducer]:
         return dict(cls.reducers)
+
+
+# 取一个类**自己**声明的注解，并把字符串注解解析回真实类型。
+#
+# 什么时候调用：
+#   State.__init_subclass__ 里，用来拿"这个子类声明了哪些字段"。
+#
+# 为什么这么设计（两个坑）：
+#   1. Python 3.14 起 (PEP 649) 注解是惰性求值的，类字典里没有
+#      "__annotations__" 这一项 —— 用 __dict__ 取会拿到 None，于是
+#      reducer 静默消失（reducers 变空 -> 每个字段写入都报"未声明"）。
+#      所以读 cls.__annotations__（3.10+ 起它只含本类自己的注解）。
+#   2. `from __future__ import annotations` 会把所有注解变成**字符串**。
+#      字符串没有 __metadata__，_extract_reducer 会返回 None -> reducer
+#      静默退化成 last-write-wins（并行分支写同一字段直接报并发冲突）。
+#      所以要把字符串解析回真实类型。
+def _own_annotations(cls) -> dict:
+    own = dict(getattr(cls, "__annotations__", {}) or {})
+    if not any(isinstance(v, str) for v in own.values()):
+        return own
+
+    # 解析字符串注解。做法与 typing.get_type_hints 一致（它内部也是
+    # ForwardRef + eval），但逐个字段解析：某一个字段解析不了
+    # （比如引用了还没定义的名字），不应该连累其他字段的 reducer。
+    g = getattr(sys.modules.get(cls.__module__, None), "__dict__", {})
+    loc = dict(vars(cls))
+    out = dict(own)
+    for name, ann in own.items():
+        if not isinstance(ann, str):
+            continue
+        try:
+            out[name] = eval(ann, g, loc)  # noqa: S307 - 同 get_type_hints 的做法
+        except Exception:  # noqa: BLE001 - 解析不了就保持字符串
+            pass                             # -> 退化成 LAST_VALUE，和以前一样
+    return out
 
 
 # 从 `Annotated[T, ...]` 中取出 reducer。
