@@ -275,6 +275,45 @@ minigraph 遇到 `GraphInterrupt` 时，跳过：
 minigraph 选择整步回滚作为教学简化。两者在现有测试场景最终状态一致，
 但副作用次数不同，不能据此声称真实 LangGraph 也总是整批重跑。
 
+### 8.1 多个节点同时挂起
+
+同一超步里可能有多个节点各自调 `interrupt()`。它们**全都**要记下来 ——
+只记一个的话，另一个重跑时永远等不到自己的值，两个中断会互相顶死
+（一个答复完，另一个又挂起，永远转不完）。
+
+因此 checkpoint 里除了 `interrupt`（第一个，兼容旧写法）还存了：
+
+| 字段 | 内容 |
+| --- | --- |
+| `interrupts` | 本步**所有**挂起点：`{slot, node, idx, push, step, value}` |
+| `resumes` | 已收集到的 resume 值：`槽位 -> 值队列` |
+| `slots` | 本批任务的槽位分配（重跑时槽位不能漂移） |
+
+**`resumes` 必须跨 resume 累积**：整步回滚意味着挂起的节点会重跑，
+重跑时还得拿到当初那个值。槽位存的是**队列**而不是单个值，
+一个节点里连续多次 `interrupt()` 时按调用顺序出队。
+
+### 8.2 resume 的三种形态
+
+```python
+# 标量：答复下一个待恢复的中断（对齐 LangGraph 的 "resume the next interrupt"）
+app.invoke(None, {**cfg, "resume": "批准"})
+
+# 字典：一次性答复多个（键是节点名或槽位）—— 对齐 LangGraph 的 resume map
+app.invoke(None, {**cfg, "resume": {"a": "A", "b": "B"}})
+
+# 字典 + 列表：一个节点里连续多次 interrupt 的值，按调用顺序取
+app.invoke(None, {**cfg, "resume": {"ask": ["V1", "V2"]}})
+```
+
+逐个答复时（标量形态），每次答复一个，剩下的继续挂着：
+
+```text
+第 1 次 invoke  -> 挂起（a、b 都在等）
+第 2 次 resume  -> a 拿到值，b 还在等        -> 仍挂起
+第 3 次 resume  -> b 也拿到值，整批提交      -> 图跑完
+```
+
 ---
 
 ## 9. checkpoint、流式输出与时间旅行
@@ -286,6 +325,9 @@ minigraph 选择整步回滚作为教学简化。两者在现有测试场景最�
    触发通道不会泄漏到 `update`。
 3. 重新计算一次 `upcoming`，写入 checkpoint 的 `next/tasks`。
 4. 保存通道值、版本、水位线。
+
+挂起时（有人调了 `interrupt()`）额外存三样，见 §8.1：
+`interrupts`（所有挂起点）、`resumes`（已收集的 resume 值）、`slots`（本批槽位）。
 
 `update_state(..., as_node="b")` 的做法是：
 

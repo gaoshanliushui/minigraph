@@ -343,6 +343,84 @@ def test_interrupt_inside_parallel_batch_rolls_back_the_superstep():
     assert out["log"] == ["fast", "slow:ok"]           # 不丢、不重复
 
 
+# ---------------------------------------------------------------- 6b. 多个中断
+def _two_interrupting_graph():
+    """两个节点在同一超步里各自 interrupt。"""
+
+    class S(State):
+        log: Annotated[list, operator.add]
+
+    g = StateGraph(S)
+    g.add_node("fork", lambda s: [Send("a", {}), Send("b", {})])
+    g.add_node("a", lambda s: {"log": [f"a:{interrupt('need-a')}"]})
+    g.add_node("b", lambda s: {"log": [f"b:{interrupt('need-b')}"]})
+    g.add_edge(START, "fork")
+    g.add_edge("fork", "a")
+    g.add_edge("fork", "b")
+    g.add_edge("a", END)
+    g.add_edge("b", END)
+    return g
+
+
+def test_multiple_interrupts_are_all_recorded():
+    """同一超步里的多个挂起点必须**全部**记下来（只记一个会让另一个永远等不到值）。"""
+    app = _two_interrupting_graph().compile(InMemorySaver())
+    cfg = {"thread_id": "multi"}
+
+    app.invoke({"log": []}, cfg)
+    pending = app.get_state(cfg).interrupts
+    assert [p["node"] for p in pending] == ["a", "b"]
+    assert [p["value"] for p in pending] == ["need-a", "need-b"]
+
+
+def test_multiple_interrupts_resumed_with_a_mapping():
+    """用 dict 一次性答复多个挂起点（对齐 LangGraph 的 resume map）。"""
+    app = _two_interrupting_graph().compile(InMemorySaver())
+    cfg = {"thread_id": "multi-map"}
+
+    app.invoke({"log": []}, cfg)
+    out = app.invoke(None, {**cfg, "resume": {"a": "A", "b": "B"}})
+    assert out["log"] == ["a:A", "b:B"]
+    assert app.get_state(cfg).interrupt is None
+
+
+def test_multiple_interrupts_resumed_one_by_one():
+    """标量 resume 逐个答复：每次答复一个，剩下的继续挂着，不会死循环。"""
+    app = _two_interrupting_graph().compile(InMemorySaver())
+    cfg = {"thread_id": "multi-scalar"}
+
+    app.invoke({"log": []}, cfg)
+    app.invoke(None, {**cfg, "resume": "v2"})
+    assert app.get_state(cfg).interrupt["node"] == "b"    # a 已答复，b 还在等
+
+    out = app.invoke(None, {**cfg, "resume": "v3"})
+    assert out["log"] == ["a:v2", "b:v3"]
+    assert app.get_state(cfg).interrupt is None
+
+
+def test_one_node_interrupting_twice_consumes_values_in_order():
+    """同一节点里连续两次 interrupt：值按调用顺序出队（对齐 LangGraph）。"""
+
+    class S(State):
+        log: Annotated[list, operator.add]
+
+    def twice(s):
+        v1 = interrupt("第一次")
+        v2 = interrupt("第二次")
+        return {"log": [f"{v1}/{v2}"]}
+
+    g = StateGraph(S)
+    g.add_node("ask", twice)
+    g.add_edge(START, "ask")
+    g.add_edge("ask", END)
+
+    app = g.compile(InMemorySaver())
+    cfg = {"thread_id": "twice"}
+    app.invoke({"log": []}, cfg)
+    out = app.invoke(None, {**cfg, "resume": {"ask": ["V1", "V2"]}})
+    assert out["log"] == ["V1/V2"]
+
+
 # ---------------------------------------------------------------- 8. 状态 schema
 def test_state_schema_reads_own_annotations():
     """State 子类的 reducer 必须从**本类自己**的注解里提取。

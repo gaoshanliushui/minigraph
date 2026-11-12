@@ -46,6 +46,23 @@ class Checkpoint:
     # "图被冻住了，必须传 config={'resume': ...} 才能继续"。
     interrupt: dict[str, Any] | None = None
 
+    # 同一超步里**所有**挂起点。多个节点并行挂起时会有多个 ——
+    # interrupt 字段只是第一个（兼容旧写法），这里才是完整列表。
+    # 恢复时按节点名或槽位给值，可以一次把几个都答复掉。
+    interrupts: list[dict[str, Any]] = field(default_factory=list)
+
+    # 已收集到的 resume 值：槽位 -> 值队列。
+    #   - 多个节点同时挂起：每个槽位各有一个值
+    #   - 一个节点里多次 interrupt()：同一个槽位有多个值，按调用顺序出队
+    # 整步回滚意味着挂起的节点会重跑，所以这些值必须**跨 resume 累积保存**，
+    # 否则重跑时取不到已经答复过的那个。
+    resumes: dict[str, list[Any]] = field(default_factory=dict)
+
+    # 挂起那一批任务的槽位分配：{name, idx, push, slot}。
+    # 恢复时整批重跑，靠它把每个任务还原成当初的槽位 —— 否则槽位里的
+    # step 号会漂移，之前答复过的值就配不上槽位了。
+    slots: list[dict[str, Any]] = field(default_factory=list)
+
     # ---- 通道模型的持久化状态 ----------------------------------------
     #
     # values 是**扁平的状态投影**（只含状态字段，给 get_state 用）；
@@ -69,6 +86,9 @@ class Checkpoint:
             id=self.id, step=self.step, values=_c.deepcopy(self.values),
             next=tuple(self.next), tasks=_c.deepcopy(self.tasks),
             interrupt=_c.deepcopy(self.interrupt),
+            interrupts=_c.deepcopy(self.interrupts),
+            resumes=_c.deepcopy(self.resumes),
+            slots=_c.deepcopy(self.slots),
             channel_values=_c.deepcopy(self.channel_values),
             channel_versions=_c.deepcopy(self.channel_versions),
             versions_seen=_c.deepcopy(self.versions_seen),

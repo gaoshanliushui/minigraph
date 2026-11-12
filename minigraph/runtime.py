@@ -361,14 +361,21 @@ class CompiledGraph:
             # checkpoint 目前不保存 updated_channels；恢复后的第一轮检查
             # 所有节点，之后仍走 changed-channel 反向索引。
             if snap.interrupt:
-                if not has_resume:
+                pending = list(snap.interrupts or [snap.interrupt])
+                # 已经答复过的值要**保留**：整步回滚意味着挂起的节点会重跑，
+                # 重跑时还得拿到当初那个值。
+                store = {k: list(v) for k, v in (snap.resumes or {}).items()}
+                if not has_resume and not store:
                     raise RuntimeError(
                         f"该 thread 停在 interrupt({snap.interrupt['value']!r})，"
                         f"需要 config={{'resume': ...}} 才能继续"
                     )
-                _ctx()["resume"] = {snap.interrupt["slot"]: resume_val}
+                if has_resume:
+                    store = _merge_resume(store, pending, resume_val)
+                _ctx()["resume"] = store
                 if debug:
-                    print(f"[resume] step={rt.step} from interrupt at {snap.interrupt['node']}")
+                    print(f"[resume] step={rt.step} from interrupt at "
+                          f"{[p['node'] for p in pending]}")
             else:
                 _ctx()["resume"] = {}
                 if debug:
@@ -427,9 +434,6 @@ class CompiledGraph:
 
         rt = self._begin(input, snap, cfg)
 
-        # 恢复时：被中断的任务必须落回它当初的槽位，才能取到 resume 值
-        pending_slot = snap.interrupt["slot"] if (snap is not None and snap.interrupt) else None
-
         self._last_values = rt.projection()
         while True:
             # ① 算触发：上一轮哪些通道变了，它们的订阅者里谁该醒
@@ -448,18 +452,20 @@ class CompiledGraph:
             snapshot = rt.read()
 
             # ③ 并发跑本批任务
-            runs = self._assign_slots(tasks, rt.step, pending_slot, snap)
-            pending_slot = None
+            runs = self._assign_slots(tasks, rt.step, snap)
+            # 本超步开始前的 resume 队列快照。挂起时整步回滚，已经被
+            # 消费掉的 resume 值必须还原 —— 否则重跑时取不到。
+            store_before = {k: list(v) for k, v in (_ctx().get("resume") or {}).items()}
             results = _execute_batch(self.nodes, runs, snapshot)
 
             # ④ 收写入：把节点返回值翻译成「(节点, 通道, 值)」
-            writes, ran, hit = self._collect_writes(runs, results, snapshot)
+            writes, ran, hits = self._collect_writes(runs, results, snapshot)
 
             # 有节点挂起 -> 整步作废：不应用任何写入、不推进版本、不动水位线。
             # 于是恢复时算触发会得出**同一批任务**，整批重跑。
-            if hit is not None:
-                self._suspend(rt, tasks, hit, saver, thread_id)
-                yield hit.task.name, rt.step + 1, {}
+            if hits:
+                self._suspend(rt, runs, hits, store_before, saver, thread_id)
+                yield hits[0].task.name, rt.step + 1, {}
                 return
 
             # ⑤⑥ 落盘：推水位线、消费屏障、应用写入、清理过期通道
@@ -491,7 +497,6 @@ class CompiledGraph:
 
     # -- ③ 分配槽位 --------------------------------------------------------
     def _assign_slots(self, tasks: list[Task], step: int,
-                      pending_slot: str | None,
                       snap: Checkpoint | None) -> list[tuple[Task, str]]:
         """
         给每个任务分配一个**槽位**（slot）。
@@ -499,19 +504,19 @@ class CompiledGraph:
         槽位是 interrupt / resume 的握手地址：节点内部调 interrupt() 时
         并不知道自己是谁，只能靠当前槽位去取 resume 值。
 
-        恢复时，被中断的那个任务必须落回它当初的槽位（pending_slot），
-        否则取不到当初注入的 resume 值。
+        恢复时，整批任务必须落回它们当初的槽位，否则槽位里的 step 号
+        会漂移，之前答复过的 resume 值就配不上槽位了。
         """
+        recorded = {
+            (r["name"], r.get("idx", 0), bool(r.get("push", False))): r["slot"]
+            for r in (snap.slots if snap and snap.slots else [])
+        }
         runs: list[tuple[Task, str]] = []
         for task in tasks:
-            is_pending = (
-                pending_slot
-                and task.name == snap.interrupt["node"]
-                and task.idx == snap.interrupt.get("idx", 0)
-                and task.is_push == snap.interrupt.get("push", False)
-            )
             kind = "push" if task.is_push else "pull"
-            slot = pending_slot if is_pending else f"{task.name}@{step + 1}#{kind}:{task.idx}"
+            slot = recorded.get((task.name, task.idx, task.is_push))
+            if slot is None:
+                slot = f"{task.name}@{step + 1}#{kind}:{task.idx}"
             runs.append((task, slot))
         return runs
 
@@ -520,18 +525,20 @@ class CompiledGraph:
         """
         ④ 把节点返回值翻译成「(节点, 通道, 值)」。
 
-        同时挑出本步挂起的那个任务（有人调了 interrupt()）。
+        同时挑出本步**所有**挂起的任务（有人调了 interrupt()）。
+        多个节点并行挂起时，它们都要被记下来 —— 少记一个，
+        那个节点重跑时会永远等不到自己的 resume 值。
         """
         writes: list[tuple[str, str, Any]] = []
         ran: list[str] = []
-        hit: _Hit | None = None
+        hits: list[_Hit] = []
         for (task, slot), out in zip(runs, results):
             name = task.name
             if isinstance(out, GraphInterrupt):
                 # 挂起 = 本超步作废：已提交的写入会被丢弃，恢复后整批重跑。
                 # 这正是 BSP 屏障（"一步要么全提交，要么全不提交"）的含义，
                 # 也是 checkpoint 存在**超步级**的根本原因 —— 所以节点要幂等。
-                hit = _Hit(task=task, slot=slot, value=out.value)
+                hits.append(_Hit(task=task, slot=slot, value=out.value))
                 continue
             if isinstance(out, _NodeError):
                 raise RuntimeError(f"节点 {name!r} 执行失败：{out.exc}") from out.exc
@@ -539,7 +546,7 @@ class CompiledGraph:
             node_writes = _normalize(name, out, snapshot, self.nodes, self.channels,
                                      self.reducers)
             writes.extend((name, c, v) for c, v in node_writes)
-        return writes, ran, hit
+        return writes, ran, hits
 
     # -- ⑤⑥ 落盘 -----------------------------------------------------------
     def _advance(self, rt: _RuntimeState, tasks: list[Task],
@@ -564,23 +571,37 @@ class CompiledGraph:
         rt.expire_unwritten({c for _, c, _ in writes}, next_version)
 
     # -- 挂起 --------------------------------------------------------------
-    def _suspend(self, rt: _RuntimeState, tasks: list[Task], hit: _Hit,
+    def _suspend(self, rt: _RuntimeState, runs: list[tuple[Task, str]],
+                 hits: list[_Hit], store_before: dict[str, list[Any]],
                  saver, thread_id: str | None) -> None:
         """
         挂起：冻结在 interrupt 处，存一份 checkpoint，然后结束这次运行。
 
         冻结的是**超步边界**：本步的写入一律不应用、版本一律不推进、
         水位线一律不动。于是恢复时算触发会得出**同一批任务**，整批重跑。
+
+        存三样和恢复有关的东西：
+          interrupts  本步**所有**挂起点（多个节点同时挂起时要全记）
+          resumes     已收集到的 resume 值（整步回滚，重跑时还要用）
+          slots       本批任务的槽位分配（重跑时槽位不能漂移）
         """
+        tasks = [t for t, _ in runs]
         this_step = rt.step + 1          # 挂起这一步的编号 = 它本该成为的超步号
+        records = [
+            {"slot": h.slot, "node": h.task.name, "idx": h.task.idx,
+             "push": h.task.is_push, "step": this_step, "value": h.value}
+            for h in hits
+        ]
         ckpt = Checkpoint(
             id=saver.new_id() if saver else "ephemeral",
             step=this_step, values=rt.projection(),
             next=tuple(t.name for t in tasks),
             tasks=[t.send if t.is_push else t.name for t in tasks],
-            interrupt={"slot": hit.slot, "node": hit.task.name,
-                       "idx": hit.task.idx, "push": hit.task.is_push,
-                       "step": this_step, "value": hit.value},
+            interrupt=records[0] if records else None,
+            interrupts=records,
+            resumes={k: list(v) for k, v in store_before.items()},
+            slots=[{"name": t.name, "idx": t.idx, "push": t.is_push, "slot": s}
+                   for (t, s) in runs],
             channel_values={c: ch.checkpoint() for c, ch in rt.channels.items()},
             channel_versions=dict(rt.versions),
             versions_seen={k: dict(v) for k, v in rt.seen.items()},
@@ -588,7 +609,8 @@ class CompiledGraph:
         if saver and thread_id:
             saver.put(thread_id, ckpt)
         self._last_values = rt.projection()
-        self._interrupted = hit.value
+        self._interrupted = hits[0].value
+        self._interrupts = [h.value for h in hits]
 
     # -- 存 checkpoint ------------------------------------------------------
     def _save(self, rt: _RuntimeState, saver, thread_id: str) -> None:
@@ -613,6 +635,39 @@ class _NodeError:
 # ---------------------------------------------------------------------------
 # 触发判定
 # ---------------------------------------------------------------------------
+
+def _merge_resume(store: dict[str, list[Any]], pending: list[dict[str, Any]],
+                  value: Any) -> dict[str, list[Any]]:
+    """
+    把用户带来的 resume 值并进"槽位 -> 值队列"。
+
+    `value` 有两种形态：
+
+      - **标量**：给第一个待恢复的中断（对齐 LangGraph 的
+        "a single value with which to resume the next interrupt"）。
+      - **字典**：键可以是槽位（"b@2#push:1"）或节点名（"b"）。
+        节点名会命中该节点**所有**待恢复的槽位。
+        值本身可以是列表 —— 对应"一个节点里连续多次 interrupt()"。
+
+    队列而不是单值：整步回滚会让节点重跑，已经答复过的值必须留着；
+    一个节点多次 interrupt() 时也要按调用顺序逐个取。
+    """
+    if isinstance(value, Mapping):
+        for key, val in value.items():
+            targets = [p for p in pending if p["slot"] == key] or \
+                      [p for p in pending if p["node"] == key]
+            for p in targets:
+                queue = store.setdefault(p["slot"], [])
+                if isinstance(val, (list, tuple)):
+                    queue.extend(val)
+                else:
+                    queue.append(val)
+        return store
+    for p in pending:
+        store.setdefault(p["slot"], []).append(value)
+        break
+    return store
+
 
 def _triggers(channels: dict[str, BaseChannel], versions: dict[str, int],
               seen: dict[str, int] | None, trig: list[str]) -> bool:
