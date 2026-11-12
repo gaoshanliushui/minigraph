@@ -340,6 +340,48 @@ app.invoke(None, {**cfg, "resume": {"ask": ["V1", "V2"]}})
 
 `recursion_limit` 只在“还有任务要跑”时检查；图恰好在第 limit 步完成是正常结束。
 
+### 9.1 两种 saver
+
+runtime 只认四个方法：`new_id()` / `put(thread_id, ckpt)` / `list(thread_id)` /
+`get(thread_id, checkpoint_id=None)`。两种实现可以互换：
+
+| | `InMemorySaver` | `SqliteSaver` |
+| --- | --- | --- |
+| 位置 | `minigraph/checkpoint.py` | `minigraph/checkpoint_sqlite.py` |
+| 存哪儿 | 进程内存 | SQLite 文件 |
+| 进程重启后 | 没了 | 还在 |
+| 适合 | 单测、demo | 真正要落盘的场景 |
+
+```python
+from minigraph.checkpoint_sqlite import SqliteSaver
+
+saver = SqliteSaver("checkpoints.db")     # 也可以给一个 sqlite3.Connection
+app = g.compile(checkpointer=saver)
+```
+
+`SqliteSaver` 存一张表：
+
+```sql
+CREATE TABLE checkpoints (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,   -- 写入顺序
+    thread_id     TEXT    NOT NULL,
+    checkpoint_id TEXT    NOT NULL,
+    step          INTEGER NOT NULL,
+    data          BLOB    NOT NULL,                    -- 序列化后的整份快照
+    created_at    REAL    NOT NULL
+);
+```
+
+快照用**带类型标签的 JSON** 存：JSON 装不下的东西（`MISSING` 哨兵、
+`Send` 对象、`set`、tuple、bytes）包一层 `{"__mg_type__": ...}`，读回来时还原。
+
+不用 pickle 的原因：反序列化不可信文件等于执行任意代码，而且 pickle
+跨 Python 版本不稳。代价是**自定义类型的 state 值存不进去** ——
+会明确抛 `TypeError`，而不是悄悄丢数据。
+
+`tests/test_sqlite_checkpointer.py` 用同一个 fixture 把同一套断言对两种 saver
+各跑一遍，确保 sqlite 版是内存版的**行为等价替身**。
+
 ---
 
 ## 10. 两条容易混淆的汇聚语义

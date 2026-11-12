@@ -206,6 +206,17 @@ def review(state):
 resume 槽位包含节点名、超步号、PULL/PUSH 类型和组内序号，保证循环或扇出中
 同一节点多次挂起时不会拿错值。
 
+resume 值有两种形态：
+
+```python
+{"resume": "approve"}                        # 标量：答复下一个待恢复的中断
+{"resume": {"review": "approve"}}            # 字典：键是节点名，一次答复多个
+{"resume": {"review": ["v1", "v2"]}}         # 列表：一个节点里多次 interrupt 的值
+```
+
+同一超步里多个节点同时挂起时，它们**全都**会被记进 checkpoint —— 只记一个的话，
+另一个重跑时永远等不到自己的值，两个中断会互相顶死。
+
 ### 6.2 时间旅行
 
 `get_state_history()` 取历史快照，`update_state(..., as_node=...)` 改写状态并
@@ -219,6 +230,21 @@ minigraph 中，同一超步只要有节点调用 `interrupt()`，本步所有�
 **这是 minigraph 有意的教学简化，不应误写成真实 LangGraph 的唯一实现。**
 实测 LangGraph 1.2.16 会保留已完成兄弟任务的结果、只重跑未完成任务；
 在标准测试场景中两者最终状态一致，但节点副作用次数不同。
+
+### 6.4 落盘：SqliteSaver
+
+`InMemorySaver` 只活在进程里。要让图"重启后还能接着跑"，换一个 saver 即可
+（接口完全一致，两者可互换）：
+
+```python
+from minigraph.checkpoint_sqlite import SqliteSaver
+
+app = g.compile(checkpointer=SqliteSaver("checkpoints.db"))
+```
+
+快照用带类型标签的 JSON 存进 SQLite（`MISSING` 哨兵、`Send` 对象、`set`、
+tuple、bytes 都能原样还原），不用 pickle —— 反序列化不可信文件等于执行任意代码。
+代价是自定义类型的 state 值存不进去，会明确抛 `TypeError` 而不是悄悄丢数据。
 
 ---
 
@@ -264,7 +290,7 @@ harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。
 | 动态路由 | `Command(goto=...)` | 同名 | `control.py` |
 | 并行扇出 | `Send(node, arg)` | 同名 | `control.py` |
 | 人工中断 | `interrupt()` | 同名 | `context.py` |
-| 持久化 | `InMemorySaver` 等 | `InMemorySaver` | `checkpoint.py` |
+| 持久化 | `InMemorySaver` / `SqliteSaver` 等 | `InMemorySaver` / `SqliteSaver` | `checkpoint.py`、`checkpoint_sqlite.py` |
 | 执行内核 | Pregel loop | `CompiledGraph._run` | `runtime.py` |
 | 触发判定 | `prepare_next_tasks/_triggers` | 同名精简实现 | `runtime.py` |
 
