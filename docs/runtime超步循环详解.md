@@ -12,27 +12,48 @@
 
 ```python
 while True:
-    tasks = _prepare_next_tasks(       # 变化通道 -> 订阅者 -> 待执行任务
-        channels, versions, seen, nodes,
-        trigger_to_nodes=trigger_to_nodes,
-        updated_channels=updated_channels,
-    )
+    tasks = self._next_tasks(rt)      # ① 变化通道 -> 订阅者 -> 待执行任务
     if not tasks:
         break
 
-    snapshot = _read_state(...)        # 同一超步共享同一状态快照
-    results = _execute_batch(...)      # 本批任务并发执行
-    writes = _normalize(...)           # 节点结果 -> 状态/触发通道写入
+    snapshot = rt.read()               # ② 同一超步共享同一状态快照
+    runs = self._assign_slots(...)     # ③ 给每个任务发一个 interrupt 槽位
+    results = _execute_batch(...)      #   本批任务并发执行
+    writes, ran, hit = self._collect_writes(...)   # ④ 节点结果 -> 状态/触发通道写入
 
-    # 有 interrupt：整步不提交，直接保存 checkpoint
-    # 否则：
-    # 1. 记录本步执行前的 versions_seen
-    # 2. consume 触发通道（屏障重新武装）
-    # 3. apply_writes 合并并推进版本
-    # 4. EphemeralValue 自清，得到下一轮 updated_channels
+    if hit is not None:                # 有 interrupt：整步不提交，存 checkpoint 后返回
+        self._suspend(...)
+        return
+
+    self._advance(rt, tasks, writes)   # ⑤⑥ 落盘：水位线 / consume / apply / 自清
+```
+
+`_advance()` 内部固定四小步，顺序不能换：
+
+```python
+rt.advance_watermarks(tasks)          # 1. 记录本步执行前的 versions_seen
+next_version = rt.next_version()
+rt.updated = set()
+rt.consume_triggers(tasks, ...)       # 2. consume 触发通道（屏障重新武装）
+rt.updated |= _apply_writes(...)      # 3. apply_writes 合并并推进版本
+rt.expire_unwritten(written, ...)     # 4. EphemeralValue 自清，得到下一轮 updated_channels
 ```
 
 这里的“图”不再参与运行时查下一跳。运行时只面对通道、通道版本和节点水位线。
+
+### 代码地图
+
+| 想看什么 | 去哪 |
+| --- | --- |
+| 一个超步的骨架 | `CompiledGraph._run()` |
+| 三张表（通道值 / 版本 / 水位线）长什么样 | `_RuntimeState`（`runtime.py` 顶部） |
+| 触发判定 | `_triggers()`、`_prepare_next_tasks()` |
+| 节点返回值怎么变成通道写入 | `_normalize()`、`_control_writes()` |
+| 版本号与水位线怎么推进 | `_RuntimeState.advance_watermarks()` / `consume_triggers()` / `expire_unwritten()` |
+| 中断怎么冻结、恢复怎么重跑 | `_suspend()`、`_assign_slots()` |
+
+调试时加 `config={"debug": True}`，每个超步会打印三张表的快照（版本号 / 水位线 /
+可用通道），不用再靠脑内模拟。
 
 ---
 
@@ -307,7 +328,7 @@ g.add_edge(["a", "b"], "c")
 
 ## 11. 如何验证而不是凭感觉
 
-- `tests/test_minigraph.py`：原有 16 个行为测试。
+- `tests/test_minigraph.py`：行为测试（含 schema 提取、自环水位线规则）。
 - `tests/test_channel_runtime.py`：通道、水位线、屏障重用、PUSH、恢复等回归测试。
 - `tests/difflang/`：同一张图分别跑 minigraph 与真实 LangGraph。
 
@@ -323,5 +344,26 @@ python tests/difflang/run.py   # 解释器需要安装 langgraph
 阅读代码时最值得逐步调试的三个位置是：
 
 1. `_prepare_next_tasks()`：候选节点如何从变化通道产生。
-2. `_run()` 中水位线更新与 `_apply_writes()` 的先后顺序。
+2. `_advance()` 中水位线更新与 `_apply_writes()` 的先后顺序。
 3. `NamedBarrierValue.consume()`：屏障如何在下一轮重新武装。
+
+`config={"debug": True}` 会把每个超步的三张表打出来 —— 上面三处都能靠它验证。
+
+---
+
+## 12. 版本兼容：Python 3.14 的注解陷阱
+
+`State.__init_subclass__` 从**本类自己的**注解里提取 reducer。它读的是
+`cls.__annotations__`，不是 `cls.__dict__["__annotations__"]`：
+
+```python
+# 对（3.13 / 3.14 都成立）
+for name, ann in getattr(cls, "__annotations__", {}).items():
+```
+
+Python 3.14 起 (PEP 649) 注解是惰性求值的，类字典里**没有**
+`"__annotations__"` 这一项 —— 用 `__dict__` 取会拿到 `None`，于是 reducer
+静默消失（`reducers` 变空 -> 运行时每个字段写入都报“写了未声明的字段”）。
+
+两个版本下 `cls.__annotations__` 都只含本类自己声明的注解（3.10+ 起不再沿
+MRO 继承），所以它对 3.13 / 3.14 是同一份语义。

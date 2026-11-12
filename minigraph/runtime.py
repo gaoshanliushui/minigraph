@@ -4,11 +4,17 @@
 这一节是整个框架的**内核**。它不再是"查边列表决定下一批跑谁"，
 而是"看通道版本决定谁该醒"。
 
-每个超步只做三件事：
+## 一个超步的骨架
 
-    ① 算触发   哪些节点的输入通道变了？
-    ② 并发跑   同一超步的节点看到同一份状态快照
-    ③ 收写入   一次性合并进通道，推进通道版本号
+    ① 算触发   哪些节点的触发通道有新版本了？
+    ② 读快照   本超步共享的那一份状态
+    ③ 并发跑   同一批任务并发执行
+    ④ 收写入   把节点返回值翻译成「(通道, 值)」
+    ⑤ 落盘     应用写入、推版本号、推水位线
+    ⑥ 清旧     没人写的触发通道自己抹掉
+
+前三步是"读"，后三步是"写"。**⑤⑥ 内部的顺序不能换**，
+每一步为什么在那儿，写在对应函数的 docstring 里。
 
 对照真实 LangGraph：langgraph/pregel/_algo.py 的
 prepare_next_tasks / _triggers / apply_writes。
@@ -44,7 +50,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from .channels import (
@@ -75,6 +81,125 @@ class Task:
     @property
     def is_push(self) -> bool:
         return self.send is not None
+
+
+@dataclass
+class _Hit:
+    """本超步里挂起（interrupt）的那个任务。"""
+
+    task: Task
+    slot: str
+    value: Any
+
+
+@dataclass
+class _RuntimeState:
+    """
+    一次运行中的全部可变状态。
+
+    这几张表必须**一起**移动 —— 算触发的、写通道的、算快照的都要看它们，
+    拆成三四个参数到处传只会把调用点撑长，所以打包成一个对象。
+
+    channels  通道当前值（数据通道存状态，触发通道存"信号"）
+    versions  通道版本号，单调递增；触发全靠它
+    seen      每节点的水位线：它上次跑时看到的版本
+    updated   上一步变了的通道；下一轮算触发时只看它们的订阅者
+              （None = 不做增量优化，全量扫描所有节点）
+    extra     未声明的输入键（只读，不许写）
+    step      当前超步号
+    """
+
+    nodes: dict[str, NodeSpec]
+    reducers: Mapping[str, Reducer]
+    channels: dict[str, BaseChannel]
+    versions: dict[str, int]
+    seen: dict[str, dict[str, int]]
+    extra: dict[str, Any] = field(default_factory=dict)
+    updated: set[str] | None = None
+    step: int = 0
+
+    # -- 读 ---------------------------------------------------------------
+    def read(self) -> dict:
+        """本超步的状态快照：所有节点看到同一份 —— 这就是同步屏障。"""
+        return _read_state(self.channels, self.reducers, self.extra)
+
+    def projection(self) -> dict:
+        """扁平状态字典（给 get_state / checkpoint.values 用）。"""
+        return _state_projection(self.channels, self.reducers, self.extra)
+
+    def next_version(self) -> int:
+        """全局版本计数器：所有通道共用一个递增序列（对齐 LangGraph）。"""
+        return _next_version(self.versions)
+
+    # -- ⑤ 推水位线 -------------------------------------------------------
+    def advance_watermarks(self, tasks: list[Task]) -> None:
+        """
+        本步跑过的节点，把水位线推到**它当时看到的版本**。
+
+        注意顺序：必须用**写入前**的版本，而不是写入后的版本。
+        否则节点自己写 branch:to:自己 就会把自己的触发信号抹掉，
+        循环（回边）就再也转不起来。
+        （对齐 LangGraph apply_writes：versions_seen 用的是
+         checkpoint["channel_versions"][chan] 的写入前取值。）
+        """
+        for task in tasks:
+            # PUSH 的触发源是保留通道 __pregel_tasks，不是目标节点的
+            # branch:to:X；因此它不能推进 X 的水位线（对齐真实 LangGraph）。
+            if task.is_push:
+                self.seen.setdefault(task.name, {})
+                continue
+            spec = self.nodes.get(task.name)
+            if spec is None or not spec.triggers:
+                continue
+            node_seen = self.seen.setdefault(task.name, {})
+            for chan in spec.triggers:
+                if chan in self.versions:
+                    node_seen[chan] = self.versions[chan]
+
+    # -- ⑤ 消费触发通道 ---------------------------------------------------
+    def consume_triggers(self, tasks: list[Task], next_version: int) -> None:
+        """
+        订阅者跑完了，把触发通道"消费"掉。
+
+        绝大多数通道无需处理；NamedBarrierValue 在这里清空 seen、
+        重新武装，下一轮汇聚才能再次等齐并触发。
+        """
+        for task in tasks:
+            if task.is_push:
+                continue
+            spec = self.nodes.get(task.name)
+            if spec is None:
+                continue
+            for chan in spec.triggers:
+                ch = self.channels.get(chan)
+                if ch is not None and ch.consume():
+                    self.versions[chan] = next_version
+                    if ch.is_available():
+                        self.updated.add(chan)
+
+    # -- ⑥ 清理过期通道 ---------------------------------------------------
+    def expire_unwritten(self, written: set[str], next_version: int) -> None:
+        """
+        本步没人写、但仍然可用的通道，调 update([]) 让它抹掉自己。
+
+        分支通道正是靠这一步做到"一个超步只活一步"。
+        """
+        for chan, ch in self.channels.items():
+            if chan in written:
+                continue
+            if ch.is_available() and ch.update([]):
+                self.versions[chan] = next_version
+                if ch.is_available():
+                    self.updated.add(chan)
+
+    # -- 调试 -------------------------------------------------------------
+    def dump(self, tag: str) -> None:
+        """把三张表打出来 —— 调试超步循环时最有用的一张图。"""
+        print(f"  {tag}")
+        print("    versions:", {k: v for k, v in sorted(self.versions.items())})
+        print("    seen    :", {k: dict(sorted(v.items())) for k, v in sorted(self.seen.items())})
+        print("    avail   :", {c: (ch.get() if ch.is_available() else None)
+                               for c, ch in sorted(self.channels.items()) if ch.is_available()})
 
 
 class CompiledGraph:
@@ -192,8 +317,8 @@ class CompiledGraph:
 
         通道的"值"和"版本"是两回事：
           - 值   存在 channel_values 里
-          - 版本 存在 channel_versions 里（单调递增，触发靠它）
-          - 水位 存在 versions_seen 里（每个节点各存一份）
+          - 版本  存在 channel_versions 里（单调递增，触发靠它）
+          - 水位  存在 versions_seen 里（每个节点各存一份）
         """
         channels = {c: ch.copy() for c, ch in self.channels.items()}
         for chan, val in (snap.channel_values or {}).items():
@@ -208,35 +333,33 @@ class CompiledGraph:
         seen = {k: dict(v) for k, v in (snap.versions_seen or {}).items()}
         return channels, versions, seen
 
-    # -- 主循环 -------------------------------------------------------------
-    def _run(self, input: State | None, cfg: dict):
-        graph, reducers, saver = self.graph, self.reducers, self.checkpointer
-        thread_id = cfg.get("thread_id")
-        debug = cfg.get("debug", False)
-        limit = cfg.get("recursion_limit", 50)
+    # -- 开场：全新运行 or 从 checkpoint 恢复 ------------------------------
+    def _begin(self, input: State | None, snap: Checkpoint | None,
+               cfg: dict) -> _RuntimeState:
+        """
+        准备一次运行的初始状态。
+
+        返回的 _RuntimeState 里 `updated` 为 None 表示"下一轮算触发时
+        全量扫描所有节点"（恢复场景还没建起 changed-channel 索引）。
+        """
+        reducers = self.reducers
         has_resume = "resume" in cfg
         resume_val = cfg.get("resume")
-
-        self._interrupted = None
-        snap = saver.get(thread_id, cfg.get("checkpoint_id")) if (saver and thread_id) else None
-
-        # 运行期的通道状态（活实例）
-        channels: dict[str, BaseChannel]
-        versions: dict[str, int]
-        seen: dict[str, dict[str, int]]
-        # 未声明的输入键：允许被节点读到，但不允许被写（见 _write_state_channels）
-        extra_values: dict[str, Any] = {}
+        debug = cfg.get("debug", False)
 
         if input is None and snap is not None:
             # ---------- 从 checkpoint 恢复 ----------
             channels, versions, seen = self._restore_channels(snap)
-            # checkpoint 目前不保存 updated_channels；恢复后的第一轮检查
-            # 所有节点，之后仍走 changed-channel 反向索引。
-            updated_channels: set[str] | None = None
             extra_values = {
                 k: v for k, v in snap.values.items() if k not in reducers
             }
-            step = snap.step
+            rt = _RuntimeState(
+                nodes=self.nodes, reducers=reducers,
+                channels=channels, versions=versions, seen=seen,
+                extra=extra_values, updated=None, step=snap.step,
+            )
+            # checkpoint 目前不保存 updated_channels；恢复后的第一轮检查
+            # 所有节点，之后仍走 changed-channel 反向索引。
             if snap.interrupt:
                 if not has_resume:
                     raise RuntimeError(
@@ -245,209 +368,241 @@ class CompiledGraph:
                     )
                 _ctx()["resume"] = {snap.interrupt["slot"]: resume_val}
                 if debug:
-                    print(f"[resume] step={step} from interrupt at {snap.interrupt['node']}")
+                    print(f"[resume] step={rt.step} from interrupt at {snap.interrupt['node']}")
             else:
                 _ctx()["resume"] = {}
                 if debug:
-                    print(f"[resume] step={step} versions={versions}")
-        else:
-            # ---------- 全新运行 ----------
-            # 输入即初始状态。注意：不像节点那样强制校验——输入里带些
-            # 图内只读的键（如 user_id）是允许的，只有"写"才要求声明。
-            channels = {c: ch.copy() for c, ch in self.channels.items()}
-            versions = {c: 0 for c in channels}
-            seen = {}
-            raw = dict(input or {})
-            # 输入分两拨：已声明的写进状态通道（走 reducer），
-            # 未声明的留作 extra_values —— 它们能被节点读到，但不允许被写。
-            extra_values = {k: v for k, v in raw.items() if k not in reducers}
-            _write_state_channels(
-                reducers, channels,
-                {k: v for k, v in raw.items() if k in reducers},
-                node=START,
-            )
-            step = 0
-            _ctx()["resume"] = {}
-            if debug:
-                print(f"[start] {raw}")
+                    print(f"[resume] step={rt.step} versions={versions}")
+            return rt
 
-            # 入口：__start__ 写所有入口点的触发通道
-            start_spec = self.nodes.get(START)
-            updated_channels = set()
-            if start_spec:
-                start_version = _next_version(versions)
-                for chan in start_spec.writers:
-                    channels[chan].update([None])
-                    versions[chan] = start_version
-                    updated_channels.add(chan)
-                seen[START] = {start_spec.triggers[0]: versions[start_spec.triggers[0]]}
+        # ---------- 全新运行 ----------
+        # 输入即初始状态。注意：不像节点那样强制校验——输入里带些
+        # 图内只读的键（如 user_id）是允许的，只有"写"才要求声明。
+        channels = {c: ch.copy() for c, ch in self.channels.items()}
+        versions = {c: 0 for c in channels}
+        raw = dict(input or {})
+        # 输入分两拨：已声明的写进状态通道（走 reducer），
+        # 未声明的留作 extra_values —— 它们能被节点读到，但不允许被写。
+        extra_values = {k: v for k, v in raw.items() if k not in reducers}
+        _write_state_channels(
+            reducers, channels,
+            {k: v for k, v in raw.items() if k in reducers},
+            node=START,
+        )
+        rt = _RuntimeState(
+            nodes=self.nodes, reducers=reducers,
+            channels=channels, versions=versions, seen={},
+            extra=extra_values, updated=set(), step=0,
+        )
+        _ctx()["resume"] = {}
+        if debug:
+            print(f"[start] {raw}")
+
+        # 入口：__start__ 写所有入口点的触发通道
+        start_spec = self.nodes.get(START)
+        if start_spec:
+            start_version = rt.next_version()
+            for chan in start_spec.writers:
+                rt.channels[chan].update([None])
+                rt.versions[chan] = start_version
+                rt.updated.add(chan)
+            rt.seen[START] = {start_spec.triggers[0]: rt.versions[start_spec.triggers[0]]}
+        return rt
+
+    # -- 主循环 -------------------------------------------------------------
+    def _run(self, input: State | None, cfg: dict):
+        """
+        超步循环。骨架只有下面这几行，其余都交给 _step_* 系列：
+
+            ① 算触发 -> ② 读快照 -> ③ 并发跑 -> ④ 收写入 -> ⑤⑥ 落盘
+
+        ⑤⑥ 内部的顺序不能换，每一步为什么在那儿写在对应函数的 docstring 里。
+        """
+        saver, thread_id = self.checkpointer, cfg.get("thread_id")
+        debug = cfg.get("debug", False)
+        limit = cfg.get("recursion_limit", 50)
+
+        self._interrupted = None
+        snap = saver.get(thread_id, cfg.get("checkpoint_id")) if (saver and thread_id) else None
+
+        rt = self._begin(input, snap, cfg)
 
         # 恢复时：被中断的任务必须落回它当初的槽位，才能取到 resume 值
-        pending_slot = None
-        if snap is not None and snap.interrupt:
-            pending_slot = snap.interrupt["slot"]
+        pending_slot = snap.interrupt["slot"] if (snap is not None and snap.interrupt) else None
 
-        # ---------- 超步循环（Pregel / BSP）----------
-        self._last_values = _state_projection(channels, reducers, extra_values)
+        self._last_values = rt.projection()
         while True:
             # ① 算触发：上一轮哪些通道变了，它们的订阅者里谁该醒
-            tasks = _prepare_next_tasks(
-                channels, versions, seen, self.nodes,
-                trigger_to_nodes=self.trigger_to_nodes,
-                updated_channels=updated_channels,
-            )
+            tasks = self._next_tasks(rt)
             if not tasks:
                 break
             # 只有"还有任务要跑"才消耗步数预算。图恰好在第 limit 步结束
             # 是正常完成，不应在下一轮发现没有任务前被误判为死循环。
-            if step >= limit:
+            if rt.step >= limit:
                 raise RuntimeError(f"超过 recursion_limit={limit}，疑似死循环")
 
-            snapshot = _read_state(channels, reducers, extra_values)
+            if debug:
+                rt.dump(f"step {rt.step + 1} 触发前")
 
-            # ② 并发执行本批任务（同一超步共享同一快照）
-            runs = []
-            for task in tasks:
-                is_pending = (
-                    pending_slot
-                    and task.name == snap.interrupt["node"]
-                    and task.idx == snap.interrupt.get("idx", 0)
-                    and task.is_push == snap.interrupt.get("push", False)
-                )
-                kind = "push" if task.is_push else "pull"
-                slot = pending_slot if is_pending else f"{task.name}@{step + 1}#{kind}:{task.idx}"
-                runs.append((task, slot))
+            # ② 读快照：同一超步的所有节点看到同一份状态
+            snapshot = rt.read()
+
+            # ③ 并发跑本批任务
+            runs = self._assign_slots(tasks, rt.step, pending_slot, snap)
             pending_slot = None
-
             results = _execute_batch(self.nodes, runs, snapshot)
 
-            # ③ 收齐写入
-            writes: list[tuple[str, str, Any]] = []   # (节点, 通道, 值)
-            ran: list[str] = []
-            hit = None
-            hit_task = None
-            hit_slot = None
-
-            for (task, slot), out in zip(runs, results):
-                name = task.name
-                if isinstance(out, GraphInterrupt):
-                    # 挂起 = 本超步作废：已提交的写入会被丢弃，恢复后整批重跑。
-                    # 这正是 BSP 屏障（"一步要么全提交，要么全不提交"）的含义，
-                    # 也是 checkpoint 存在**超步级**的根本原因 —— 所以节点要幂等。
-                    hit, hit_task, hit_slot = out, task, slot
-                    continue
-                if isinstance(out, _NodeError):
-                    raise RuntimeError(f"节点 {name!r} 执行失败：{out.exc}") from out.exc
-                ran.append(name)
-                node_writes = _normalize(name, out, snapshot, self.nodes, self.channels,
-                                         reducers)
-                writes.extend((name, c, v) for c, v in node_writes)
+            # ④ 收写入：把节点返回值翻译成「(节点, 通道, 值)」
+            writes, ran, hit = self._collect_writes(runs, results, snapshot)
 
             # 有节点挂起 -> 整步作废：不应用任何写入、不推进版本、不动水位线。
-            # 于是恢复时 prepare_next_tasks 会算出**同一批任务**，整批重跑。
+            # 于是恢复时算触发会得出**同一批任务**，整批重跑。
             if hit is not None:
-                # 挂起这一步的编号 = 它本该成为的超步号（step + 1）
-                this_step = step + 1
-                ckpt = Checkpoint(
-                    id=saver.new_id() if saver else "ephemeral",
-                    step=this_step, values=_state_projection(channels, reducers, extra_values),
-                    next=tuple(t.name for t in tasks),
-                    tasks=[t.send if t.is_push else t.name for t in tasks],
-                    interrupt={"slot": hit_slot, "node": hit_task.name,
-                               "idx": hit_task.idx, "push": hit_task.is_push,
-                               "step": this_step, "value": hit.value},
-                    channel_values={c: ch.checkpoint() for c, ch in channels.items()},
-                    channel_versions=dict(versions),
-                    versions_seen={k: dict(v) for k, v in seen.items()},
-                )
-                if saver and thread_id:
-                    saver.put(thread_id, ckpt)
-                self._last_values = _state_projection(channels, reducers, extra_values)
-                self._interrupted = hit.value
-                yield hit_task.name, this_step, {}
+                self._suspend(rt, tasks, hit, saver, thread_id)
+                yield hit.task.name, rt.step + 1, {}
                 return
 
-            # ④ 更新水位线：本步跑过的节点把水位推到**它当时看到的版本**。
-            #    注意顺序：必须用**写入前**的版本，而不是写入后的版本。
-            #    否则节点自己写 branch:to:自己 就会把自己的触发信号抹掉，
-            #    循环（回边）就再也转不起来。
-            #    （对齐 LangGraph apply_writes：versions_seen 用的是
-            #     checkpoint["channel_versions"][chan] 的写入前取值。）
-            for task in tasks:
-                # PUSH 的触发源是保留通道 __pregel_tasks，不是目标节点的
-                # branch:to:X；因此它不能推进 X 的水位线（对齐真实 LangGraph）。
-                if task.is_push:
-                    seen.setdefault(task.name, {})
-                    continue
-                spec = self.nodes.get(task.name)
-                if spec is None or not spec.triggers:
-                    continue
-                node_seen = seen.setdefault(task.name, {})
-                for chan in spec.triggers:
-                    if chan in versions:
-                        node_seen[chan] = versions[chan]
+            # ⑤⑥ 落盘：推水位线、消费屏障、应用写入、清理过期通道
+            self._advance(rt, tasks, writes)
 
-            # 消费本步的触发通道。绝大多数通道无需处理；NamedBarrierValue
-            # 在这里清空 seen、重新武装，下一轮汇聚才能再次等齐并触发。
-            next_version = _next_version(versions)
-            updated_channels = set()
-            for task in tasks:
-                if task.is_push:
-                    continue
-                spec = self.nodes.get(task.name)
-                if spec is None:
-                    continue
-                for chan in spec.triggers:
-                    ch = channels.get(chan)
-                    if ch is not None and ch.consume():
-                        versions[chan] = next_version
-                        if ch.is_available():
-                            updated_channels.add(chan)
-
-            # ⑤ 应用写入（推进通道版本号）
-            updated_channels.update(
-                _apply_writes(channels, versions, writes, next_version=next_version)
-            )
-
-            # ⑥ 自清：本步没人写但仍然可用的通道，调 update([]) 让它抹掉自己。
-            #    分支通道正是靠这一步做到"一个超步只活一步"。
-            written = {c for _, c, _ in writes}
-            for chan, ch in channels.items():
-                if chan in written:
-                    continue
-                if ch.is_available() and ch.update([]):
-                    versions[chan] = next_version
-                    if ch.is_available():
-                        updated_channels.add(chan)
-
-            step += 1
+            rt.step += 1
             if debug:
-                print(f"  step {step}: {ran} -> "
-                      f"changed={[c for _, c, _ in writes]}")
+                print(f"  step {rt.step}: {ran} -> changed={[c for _, c, _ in writes]}")
 
-            self._last_values = _state_projection(channels, reducers, extra_values)
-            yield ",".join(ran), step, {
-                c: channels[c].get() for c in dict.fromkeys(c for _, c, _ in writes)
-                if c in reducers and c in channels and channels[c].is_available()
+            self._last_values = rt.projection()
+            yield ",".join(ran), rt.step, {
+                c: rt.channels[c].get() for c in dict.fromkeys(c for _, c, _ in writes)
+                if c in self.reducers and c in rt.channels and rt.channels[c].is_available()
             }
 
             if saver and thread_id:
-                upcoming = _prepare_next_tasks(
-                    channels, versions, seen, self.nodes,
-                    trigger_to_nodes=self.trigger_to_nodes,
-                    updated_channels=updated_channels,
-                )
-                saver.put(thread_id, Checkpoint(
-                    id=saver.new_id(), step=step,
-                    values=_state_projection(channels, reducers, extra_values),
-                    next=tuple(t.name for t in upcoming),
-                    tasks=[t.send if t.is_push else t.name for t in upcoming],
-                    channel_values={c: ch.checkpoint() for c, ch in channels.items()},
-                    channel_versions=dict(versions),
-                    versions_seen={k: dict(v) for k, v in seen.items()},
-                ))
+                self._save(rt, saver, thread_id)
 
         _ctx()["slot"] = None
+
+    # -- ① 算触发 ----------------------------------------------------------
+    def _next_tasks(self, rt: _RuntimeState) -> list[Task]:
+        """① 这一超步要跑哪些任务。"""
+        return _prepare_next_tasks(
+            rt.channels, rt.versions, rt.seen, self.nodes,
+            trigger_to_nodes=self.trigger_to_nodes,
+            updated_channels=rt.updated,
+        )
+
+    # -- ③ 分配槽位 --------------------------------------------------------
+    def _assign_slots(self, tasks: list[Task], step: int,
+                      pending_slot: str | None,
+                      snap: Checkpoint | None) -> list[tuple[Task, str]]:
+        """
+        给每个任务分配一个**槽位**（slot）。
+
+        槽位是 interrupt / resume 的握手地址：节点内部调 interrupt() 时
+        并不知道自己是谁，只能靠当前槽位去取 resume 值。
+
+        恢复时，被中断的那个任务必须落回它当初的槽位（pending_slot），
+        否则取不到当初注入的 resume 值。
+        """
+        runs: list[tuple[Task, str]] = []
+        for task in tasks:
+            is_pending = (
+                pending_slot
+                and task.name == snap.interrupt["node"]
+                and task.idx == snap.interrupt.get("idx", 0)
+                and task.is_push == snap.interrupt.get("push", False)
+            )
+            kind = "push" if task.is_push else "pull"
+            slot = pending_slot if is_pending else f"{task.name}@{step + 1}#{kind}:{task.idx}"
+            runs.append((task, slot))
+        return runs
+
+    # -- ④ 收写入 ----------------------------------------------------------
+    def _collect_writes(self, runs, results, snapshot: dict):
+        """
+        ④ 把节点返回值翻译成「(节点, 通道, 值)」。
+
+        同时挑出本步挂起的那个任务（有人调了 interrupt()）。
+        """
+        writes: list[tuple[str, str, Any]] = []
+        ran: list[str] = []
+        hit: _Hit | None = None
+        for (task, slot), out in zip(runs, results):
+            name = task.name
+            if isinstance(out, GraphInterrupt):
+                # 挂起 = 本超步作废：已提交的写入会被丢弃，恢复后整批重跑。
+                # 这正是 BSP 屏障（"一步要么全提交，要么全不提交"）的含义，
+                # 也是 checkpoint 存在**超步级**的根本原因 —— 所以节点要幂等。
+                hit = _Hit(task=task, slot=slot, value=out.value)
+                continue
+            if isinstance(out, _NodeError):
+                raise RuntimeError(f"节点 {name!r} 执行失败：{out.exc}") from out.exc
+            ran.append(name)
+            node_writes = _normalize(name, out, snapshot, self.nodes, self.channels,
+                                     self.reducers)
+            writes.extend((name, c, v) for c, v in node_writes)
+        return writes, ran, hit
+
+    # -- ⑤⑥ 落盘 -----------------------------------------------------------
+    def _advance(self, rt: _RuntimeState, tasks: list[Task],
+                 writes: list[tuple[str, str, Any]]) -> None:
+        """
+        ⑤⑥ 把这一超步的写入落到通道上，并推进版本号。
+
+        四小步，顺序不能换：
+
+          1. 推水位线  用**写入前**的版本（见 advance_watermarks）
+          2. 消费屏障  NamedBarrierValue 重新武装（见 consume_triggers）
+          3. 应用写入  本步所有写入共享同一个新版本号
+          4. 清旧通道  没人写的触发通道自己抹掉（见 expire_unwritten）
+        """
+        rt.advance_watermarks(tasks)
+        next_version = rt.next_version()
+        rt.updated = set()               # 重新收集"这一步变了哪些通道"
+        rt.consume_triggers(tasks, next_version)
+        rt.updated |= _apply_writes(
+            rt.channels, rt.versions, writes, next_version=next_version
+        )
+        rt.expire_unwritten({c for _, c, _ in writes}, next_version)
+
+    # -- 挂起 --------------------------------------------------------------
+    def _suspend(self, rt: _RuntimeState, tasks: list[Task], hit: _Hit,
+                 saver, thread_id: str | None) -> None:
+        """
+        挂起：冻结在 interrupt 处，存一份 checkpoint，然后结束这次运行。
+
+        冻结的是**超步边界**：本步的写入一律不应用、版本一律不推进、
+        水位线一律不动。于是恢复时算触发会得出**同一批任务**，整批重跑。
+        """
+        this_step = rt.step + 1          # 挂起这一步的编号 = 它本该成为的超步号
+        ckpt = Checkpoint(
+            id=saver.new_id() if saver else "ephemeral",
+            step=this_step, values=rt.projection(),
+            next=tuple(t.name for t in tasks),
+            tasks=[t.send if t.is_push else t.name for t in tasks],
+            interrupt={"slot": hit.slot, "node": hit.task.name,
+                       "idx": hit.task.idx, "push": hit.task.is_push,
+                       "step": this_step, "value": hit.value},
+            channel_values={c: ch.checkpoint() for c, ch in rt.channels.items()},
+            channel_versions=dict(rt.versions),
+            versions_seen={k: dict(v) for k, v in rt.seen.items()},
+        )
+        if saver and thread_id:
+            saver.put(thread_id, ckpt)
+        self._last_values = rt.projection()
+        self._interrupted = hit.value
+
+    # -- 存 checkpoint ------------------------------------------------------
+    def _save(self, rt: _RuntimeState, saver, thread_id: str) -> None:
+        """把本步的结束状态存成 checkpoint（给 get_state / 恢复用）。"""
+        upcoming = self._next_tasks(rt)
+        saver.put(thread_id, Checkpoint(
+            id=saver.new_id(), step=rt.step,
+            values=rt.projection(),
+            next=tuple(t.name for t in upcoming),
+            tasks=[t.send if t.is_push else t.name for t in upcoming],
+            channel_values={c: ch.checkpoint() for c, ch in rt.channels.items()},
+            channel_versions=dict(rt.versions),
+            versions_seen={k: dict(v) for k, v in rt.seen.items()},
+        ))
 
 
 class _NodeError:
@@ -749,7 +904,7 @@ def _state_writes(update: Mapping[str, Any], node: str,
     状态字段 -> 状态通道写入。
 
     写未声明的字段要报错：这是作者在"表态" —— 这个字段该用哪个 reducer。
-    （输入里的未声明键是另一回事，它们只读、不许写，见 _run。）
+    （输入里的未声明键是另一回事，它们只读、不许写，见 _begin。）
 
     `{"key": None}` 视作"这次不改"（跳过）。真 LangGraph 会把 None 写进通道，
     这里跳过是为了并行友好 —— 两个并行分支各写一个字段时不该互相打架。

@@ -33,20 +33,21 @@ class S(State):
     trace: Annotated[list, operator.add]
 
 
-g = StateGraph(S)
-g.add_node("inc", lambda s: {"n": 1, "trace": ["inc"]})
-g.add_node("check", lambda s: {"trace": ["check"]})
-g.add_edge(START, "inc")
-g.add_edge("inc", "check")
-g.add_conditional_edges(
-    "check", lambda s: "again" if s["n"] < 3 else "stop", {"again": "inc", "stop": END}
-)
+if __name__ == "__main__":
+    g = StateGraph(S)
+    g.add_node("inc", lambda s: {"n": 1, "trace": ["inc"]})
+    g.add_node("check", lambda s: {"trace": ["check"]})
+    g.add_edge(START, "inc")
+    g.add_edge("inc", "check")
+    g.add_conditional_edges(
+        "check", lambda s: "again" if s["n"] < 3 else "stop", {"again": "inc", "stop": END}
+    )
 
-print("=== graph ===")
-c = g.compile()
-print("channels:", sorted(c.channels))
-print("nodes   :", {k: (v.triggers, v.writers) for k, v in c.nodes.items()})
-print()
-out = c.invoke({"n": 0, "trace": []})
-print()
-print("final:", out)
+    print("=== graph ===")
+    c = g.compile()
+    print("channels:", sorted(c.channels))
+    print("nodes   :", {k: (v.triggers, v.writers) for k, v in c.nodes.items()})
+    print()
+    out = c.invoke({"n": 0, "trace": []})
+    print()
+    print("final:", out)

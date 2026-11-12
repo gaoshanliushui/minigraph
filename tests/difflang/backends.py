@@ -61,7 +61,8 @@ class Backend:
         保证 reducer 语义完全一致。
         """
         if self.name == "minigraph":
-            # minigraph 的 State.__init_subclass__ 读 cls.__dict__["__annotations__"]
+            # minigraph 的 State.__init_subclass__ 读 cls.__annotations__
+            # （3.14 起注解是惰性的，类字典里没有 "__annotations__" 这一项）
             return type("S", (self.state_base,), {"__annotations__": dict(annotations)})
         # LangGraph 用 TypedDict，get_type_hints(include_extras=True) 读注解
         return TypedDict("S", dict(annotations))  # type: ignore[misc]

@@ -10,7 +10,7 @@ from minigraph.checkpoint import InMemorySaver
 from minigraph.constants import END, START
 from minigraph.context import interrupt
 from minigraph.control import Command, Send
-from minigraph.state import State, add_messages, merge_dict
+from minigraph.state import LAST_VALUE, State, add_messages, merge_dict
 
 
 # ---------------------------------------------------------------- 1. 基本流转
@@ -341,3 +341,54 @@ def test_interrupt_inside_parallel_batch_rolls_back_the_superstep():
 
     out = app.invoke(None, {**cfg, "resume": "ok"})
     assert out["log"] == ["fast", "slow:ok"]           # 不丢、不重复
+
+
+# ---------------------------------------------------------------- 8. 状态 schema
+def test_state_schema_reads_own_annotations():
+    """State 子类的 reducer 必须从**本类自己**的注解里提取。
+
+    Python 3.14 起 (PEP 649) 注解是惰性求值的，类字典里没有
+    "__annotations__" 这一项 —— 取错地方会**静默**得到空 schema，
+    表现为运行时每个字段写入都报"写了未声明的字段"。
+    """
+    class S(State):
+        n: Annotated[int, operator.add]
+        plain: str
+
+    assert set(S.reducers) == {"n", "plain"}
+    assert S.reducers["n"] is operator.add
+    assert S.reducers["plain"] is LAST_VALUE      # 没写 Annotated -> last-write-wins
+
+
+def test_state_schema_created_via_type():
+    """用 type(...) 造 schema（差分测试后端就是这么造的）也要能取到 reducer。"""
+    S = type("S", (State,), {"__annotations__": {"n": Annotated[int, operator.add]}})
+    assert S.reducers["n"] is operator.add
+
+
+# ---------------------------------------------------------------- 9. 触发规则
+def test_self_loop_via_command_keeps_running():
+    """节点写**自己的**触发通道时，靠的是"水位线记写入前的版本"这条规则。
+
+    若水位线记的是写入后的版本，节点就把自己这一轮的触发信号抹掉了，
+    回边转不起来 —— 循环只跑一轮就停。
+    """
+    class S(State):
+        n: Annotated[int, operator.add]
+
+    seen_n: list[int] = []
+
+    def spin(state):
+        seen_n.append(state.get("n", 0))
+        if state.get("n", 0) < 3:
+            return Command(goto="spin", update={"n": 1})
+        return {"n": 1}
+
+    g = StateGraph(S)
+    g.add_node("spin", spin)
+    g.add_edge(START, "spin")
+
+    out = g.compile().invoke({"n": 0})
+    assert seen_n == [0, 1, 2, 3]         # 靠版本推进自己唤醒自己，转了三轮
+    assert out["n"] == 4
+

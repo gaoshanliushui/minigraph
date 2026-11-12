@@ -95,7 +95,12 @@ class State(dict):
         reducers: dict[str, Reducer] = {}
         for base in reversed(cls.__mro__[1:]):
             reducers.update(getattr(base, "reducers", {}))
-        for name, ann in cls.__dict__.get("__annotations__", {}).items():
+        # 注意：这里读 cls.__annotations__，不是 cls.__dict__["__annotations__"]。
+        # Python 3.14 起 (PEP 649) 注解变成惰性求值，类字典里不再有
+        # "__annotations__" 这一项 —— 用 __dict__ 取会拿到 None，于是 reducer
+        # 静默消失（reducers 变空 -> 运行时每个字段写入都报"未声明的字段"）。
+        # 两个版本下它都只含**本类自己**声明的注解（3.10+ 起不再沿 MRO 继承）。
+        for name, ann in getattr(cls, "__annotations__", {}).items():
             if name.startswith("_") or name == "reducers":
                 continue
             reducers[name] = _extract_reducer(ann) or LAST_VALUE
