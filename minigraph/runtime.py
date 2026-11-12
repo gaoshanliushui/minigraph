@@ -121,7 +121,10 @@ class CompiledGraph:
             # 输入即初始状态。注意：不像节点那样强制校验——输入里带些
             # 图内只读的键（如 user_id）是允许的，只有"写"才要求声明。
             values = dict(input or {})
-            tasks = [graph.entry] if graph.entry else []
+            # 入口点可以有多个：add_edge(START,"a") + add_edge(START,"b")
+            # 会让 a 和 b 在第一个超步里并行跑（之前 entry 只有一个，
+            # 后者覆盖前者，前一个入口被静默丢弃）。
+            tasks = list(graph.entry_points)
             step = 0
             _ctx()["resume"] = {}
             if debug:
