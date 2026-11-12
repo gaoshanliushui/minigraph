@@ -98,7 +98,7 @@ def build():
 
 if __name__ == "__main__":
     app = build()
-    cfg = {"thread_id": "demo"}
+    cfg = {"thread_id": "demo", "debug": True}
 
     print("=" * 60)
     print("Q: 北京")
