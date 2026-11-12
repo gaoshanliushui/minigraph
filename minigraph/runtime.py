@@ -680,6 +680,7 @@ def _prepare_next_tasks(channels: dict[str, BaseChannel], versions: dict[str, in
     # 按节点名排序，保证同一批任务的顺序是确定的（恢复时槽位才对得上）
     for name in sorted(candidates):
         spec = nodes[name]
+        # __start__ 是伪节点，它只负责在开局写入口信号，本身不是任务。
         if spec.is_start:
             continue
         node_seen = seen.get(name)

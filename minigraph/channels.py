@@ -327,6 +327,7 @@ class Topic(BaseChannel):
             raise EmptyChannelError()
         return list(self.values)
 
+    "上一超步有人写过 Send,返回true"
     def is_available(self) -> bool:
         return bool(self.values)
 

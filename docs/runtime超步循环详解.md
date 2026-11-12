@@ -5,6 +5,8 @@
 >
 > 对照真实 LangGraph：`pregel/_algo.py` 的 `prepare_next_tasks`、`_triggers`、
 > `apply_writes`，以及 `graph/state.py` 的 `attach_node/edge/branch`。
+>
+> 配套阅读：《`channel通道模型详解.md`》（各类通道的语义与可用性规则）。
 
 ---
 

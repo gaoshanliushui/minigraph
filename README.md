@@ -280,6 +280,13 @@ harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。
 5. 跑 `python examples/02_hitl_and_fanout.py`，再读 checkpoint 恢复逻辑。
 6. 跑 `python tests/difflang/run.py`，对照真实 LangGraph 的执行轨迹。
 
+### 配套文档
+
+| 文档 | 讲什么 |
+| --- | --- |
+| [`docs/runtime超步循环详解.md`](docs/runtime超步循环详解.md) | `CompiledGraph._run` 的超步循环：算触发 → 并发跑 → 收写入 → 推版本 |
+| [`docs/channel通道模型详解.md`](docs/channel通道模型详解.md) | 各类通道的语义，重点是 `is_available()` 何时为真、通道活多久 |
+
 最后如果能一句话说清下面这个问题，就说明抓住了内核：
 
 > 为什么节点写一次 `branch:to:b`，`b` 就会醒，而写普通状态字段不会？
