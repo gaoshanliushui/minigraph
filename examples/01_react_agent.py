@@ -19,6 +19,7 @@
 """
 
 import operator
+from pathlib import Path
 from typing import Annotated
 
 from minigraph.builder import StateGraph
@@ -26,6 +27,11 @@ from minigraph.checkpoint import InMemorySaver
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.constants import END, START
 from minigraph.state import State, add_messages
+
+# checkpoint 落盘位置跟着**文件**走，而不是跟着当前工作目录 ——
+# 这样 `python examples/01_react_agent.py`（从仓库根跑）和
+# `cd examples && python 01_react_agent.py` 写的是同一个文件。
+_DB_PATH = Path(__file__).resolve().parent.parent / "minigraph.db"
 
 # ---------------------------------------------------------------- 假工具
 WEATHER = {"北京": "晴 18°C", "上海": "小雨 22°C"}
@@ -95,7 +101,7 @@ def build():
     g.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
     g.add_edge("tools", "agent")      # 关键：工具执行完回到模型，形成循环
     # checkpointer = InMemorySaver()
-    checkpointer =  SqliteSaver(str("../minigraph.db"))
+    checkpointer =  SqliteSaver(str(_DB_PATH))
     return g.compile(checkpointer=checkpointer)
 
 

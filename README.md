@@ -206,21 +206,41 @@ def review(state):
 resume 槽位包含节点名、超步号、PULL/PUSH 类型和组内序号，保证循环或扇出中
 同一节点多次挂起时不会拿错值。
 
-resume 值有两种形态：
+resume 值有三种形态：
 
 ```python
 {"resume": "approve"}                        # 标量：答复下一个待恢复的中断
+{"resume": {"action": "approve"}}            # 字典：整个字典原样交给 interrupt()
 {"resume": {"review": "approve"}}            # 字典：键是节点名，一次答复多个
 {"resume": {"review": ["v1", "v2"]}}         # 列表：一个节点里多次 interrupt 的值
 ```
+
+第二、三行都是字典，怎么区分？**看键对不对得上待恢复的节点名**：
+对得上（`review` 确实是个节点）就按“批量答复”解释；对不上，整个字典就是
+`interrupt()` 拿到的那个值 —— 这与真实 LangGraph 一致（`Command(resume=X)`
+里 `interrupt()` 拿到的就是 X 本身，不做节点名匹配）。
 
 同一超步里多个节点同时挂起时，它们**全都**会被记进 checkpoint —— 只记一个的话，
 另一个重跑时永远等不到自己的值，两个中断会互相顶死。
 
 ### 6.2 时间旅行
 
-`get_state_history()` 取历史快照，`update_state(..., as_node=...)` 改写状态并
-写入 `branch:to:<as_node>`，从而指定分叉后先执行哪个节点。
+`get_state_history()` 取历史快照，`update_state(..., as_node=...)` 改写状态。
+
+`as_node` 的含义是“**假装这条更新是哪个节点写的**”。既然是它写的，被点亮的就是
+**它的出边**，而不是它自己：
+
+```python
+g.add_edge("a", "b"); g.add_edge("b", "c")
+
+app.update_state(cfg, {"n": 100}, as_node="b")
+# 接下来跑的是 b 的后继 c —— 不是 b
+app.get_state(cfg).next      # -> ("c",)
+```
+
+`as_node` 指向终点节点时（出边是 `END`），图直接结束 —— `next` 为空。
+不给 `as_node` 时按水位线推断“最后一个写过状态的节点”；几个节点同时写过、
+说不清是谁，就报错请显式指定。
 
 ### 6.3 minigraph 的挂起策略：整步回滚
 
@@ -257,6 +277,8 @@ tuple、bytes 都能原样还原），不用 pickle —— 反序列化不可信
 | PUSH 节点输入 | `Send.arg` 合并到状态快照，另附 `__state__` | 只传 `Send.arg` |
 | interrupt 并行批 | 整步回滚、整批重跑 | 保留已完成任务结果，重跑未完成任务 |
 | 并发写错误类型 | `ConcurrentWriteError(RuntimeError)` | `InvalidUpdateError` |
+| 裸 dict 声明的 schema | 拿不到字段类型，reducer 通道初值为 `MISSING`（读未写过的字段会 `KeyError`） | TypedDict/Annotated 一定拿得到类型 |
+| checkpoint 历史 | 每个超步存一份 | 额外存「输入」那一份（`step=-1`/`0`） |
 
 这些差异均有注释或测试标注；其余核心调度行为通过差分场景验证。
 
@@ -270,9 +292,13 @@ tuple、bytes 都能原样还原），不用 pickle —— 反序列化不可信
 
 # 与真实 LangGraph 做同进程差分；解释器需同时能 import langgraph 和本仓库
 python tests/difflang/run.py
+
+# 差分测试也能用 pytest 跑（需要装了 langgraph 的解释器）
+/tmp/lgvenv/bin/python -m pytest tests/test_diff_langgraph.py tests/test_diff_checkpoint.py -v
 ```
 
-当前包含 65 个单元/回归测试和 14 个差分场景。差分比较：
+当前包含 69 个单元/回归测试和 23 个差分场景（14 个超步场景 + 9 个检查点场景）。
+差分比较：
 每超步节点集合、超步总数、最终状态；失败场景还会直接插桩比较报错前的节点调用次数。
 注意真实 LangGraph 的 `stream_mode="updates"` 是**按任务**产出，不是按超步；
 harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。

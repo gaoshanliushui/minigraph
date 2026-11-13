@@ -175,7 +175,7 @@ __start__   -> ['__start__']
 | 通道类型 | 用在哪 | 初始 | 写之后 | `update([])` 之后 | 什么时候变回 False |
 | --- | --- | --- | --- | --- | --- |
 | `LastValue` | 无 reducer 的状态字段 | False | True | **仍 True** | **从不** |
-| `BinaryOperatorAggregate` | 有 reducer 的状态字段 | False | True | **仍 True** | **从不** |
+| `BinaryOperatorAggregate` | 有 reducer 的状态字段 | **True**（初值 `typ()`） | True | **仍 True** | **从不** |
 | `EphemeralValue` | `branch:to:X` 分支触发 | False | True（**哪怕值是 None**） | **False** | 本超步没人写它 → 自清 |
 | `Topic(accumulate=False)` | `__pregel_tasks` Send 队列 | False | True | **False** | 同上 |
 | `Topic(accumulate=True)` | 通用发布订阅 | False | True | **仍 True** | 从不 |
@@ -190,12 +190,18 @@ def is_available(self) -> bool:
     return self.value is not MISSING
 ```
 
-判据只有一个：**值不再是 `MISSING` 哨兵**。写进去过一次就永远可用——因为
-`update([])` 对它们是 no-op（`channels.py:149-150`、`206-207`），而超步末尾的
-自清步骤（`runtime.py:190`）只在 `update([])` 返回 True 时才动手。
+判据只有一个：**值不再是 `MISSING` 哨兵**。`update([])` 对它们是 no-op
+（`channels.py:149-150`、`206-207`），而超步末尾的自清步骤只在 `update([])`
+返回 True 时才动手 —— 所以数据通道一旦有值，就永远可用。
 
 **含义**：状态字段一旦被写过，就一直在后续快照里；`update([])` 返回 False →
 不推版本号 → 这个数据通道的版本号停在原地。
+
+> `BinaryOperatorAggregate` 的初值是 `typ()`（list→`[]`、int→`0`），和真实
+> LangGraph 一致：于是节点读一个**还没被写过**的字段拿到的是零值，而不是
+> `KeyError`。拿不到类型时（裸 dict 形态声明的 schema、类型不可实例化）
+> 才退化成 `MISSING`，此时首次写入走「直接落盘」的捷径。
+> `LastValue` 没有初值 —— 没有 reducer 的字段就是「没写过就没有」。
 
 > `LastValue` 与 `BinaryOperatorAggregate` 的区别不在可用性，而在**合并语义**：
 > 前者一步只收一个值（收多个直接报 `ConcurrentWriteError`），后者按 reducer 累积。

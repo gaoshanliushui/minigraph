@@ -332,8 +332,13 @@ app.invoke(None, {**cfg, "resume": {"ask": ["V1", "V2"]}})
 `update_state(..., as_node="b")` 的做法是：
 
 1. 把人工修改写入状态通道，走 reducer。
-2. 写 `branch:to:b` 并推进版本，保证 b 会触发。
-3. 把其他节点的水位线补齐，避免它们被旧信号唤醒。
+2. 点亮 **as_node 的出边**（不是 as_node 自己）：静态目标写 `branch:to:<后继>`，
+   条件边按**合并后**的状态重新求值。
+3. 本次没写到的触发通道自清，避免上一次挂起留下的旧信号把无关节点也唤醒。
+
+于是 `as_node="b"` 之后跑的是 **b 的后继**。这与真实 LangGraph 一致
+（`bulk_update_state` 里执行的是 `self.nodes[as_node].flat_writers`）。
+不给 `as_node` 时按水位线推断“最后一个写过状态的节点”，推断不出来就报错。
 
 `MISSING` 在 `copy/deepcopy` 后仍保持单例，否则空通道会在 checkpoint 恢复时
 被误认为“有值”。

@@ -333,11 +333,13 @@ minigraph 的实现用 `MISSING` 哨兵区分「没有」和「是 None」，比
 1. **reducer 用谁的视角**——更新会按该字段的 reducer 合并（所以 `messages` 是追加、`count` 是累加，不会直接覆盖）；
 2. **接下来从哪继续**——框架按 `as_node` 在该图中的出边推算 `next`。如果 `as_node` 是终点节点，`next` 就是空，图直接结束；如果是中间节点，就顺着它的出边继续。
 
-所以「人工修正后继续跑」的写法是：`as_node` 设为你**希望它表现为刚执行完的那个节点**。不传则沿用当前 `next`。
+所以「人工修正后继续跑」的写法是：`as_node` 设为你**希望它表现为刚执行完的那个节点**。不传的话，框架按水位线推断「最后一个写过状态的节点」；几个节点同时写过、说不清是谁，就报 `Ambiguous update` 要求显式指定。
 
 实测：从 step=1 的状态 `update_state(..., as_node="b")`，因为 b 是终点，`next` 变成 `()`，图直接结束；想继续得选一个还没跑完的节点。
 
-↗ `graph.py` L348-366
+⚠️ 容易踩的坑：`as_node="b"` **不是**「让 b 重跑」，而是「让 b 的**出边**生效」。真实 LangGraph 的 `bulk_update_state` 执行的是 `self.nodes[as_node].flat_writers` —— 写出去的是 b 的**后继**触发通道。所以 `as_node` 填 b，图从 c 继续；填 a，图从 b 继续。
+
+↗ `runtime.py` 的 `CompiledGraph.update_state`
 
 ---
 

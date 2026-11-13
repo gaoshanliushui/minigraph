@@ -10,15 +10,22 @@ B. Map-Reduce 扇出：Send 把 N 个子任务并行派发，reducer 自动汇�
 """
 
 import operator
+from pathlib import Path
 import time
 from typing import Annotated
 
 from minigraph.builder import StateGraph
 from minigraph.checkpoint import InMemorySaver
+from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.constants import END, START
 from minigraph.context import interrupt
 from minigraph.control import Send
 from minigraph.state import State
+
+# checkpoint 落盘位置跟着**文件**走，而不是跟着当前工作目录 ——
+# 这样 `python examples/01_react_agent.py`（从仓库根跑）和
+# `cd examples && python 01_react_agent.py` 写的是同一个文件。
+_DB_PATH = Path(__file__).resolve().parent.parent / "minigraph.db"
 
 
 # ================================================================ A. 人工审批
@@ -80,7 +87,9 @@ def build_draft_graph():
     )
     g.add_edge("revise", "human_review")     # 打回后再走一次审批
     g.add_edge("publish", END)
-    return g.compile(checkpointer=InMemorySaver())
+    # checkpointer = InMemorySaver()
+    checkpointer = SqliteSaver(str(_DB_PATH))
+    return g.compile(checkpointer=checkpointer)
 
 
 def demo_hitl():
@@ -144,7 +153,9 @@ def build_map_reduce():
     g.add_edge("dispatch", "research_one")
     g.add_edge("research_one", "report")
     g.add_edge("report", END)
-    return g.compile()
+    # checkpointer = InMemorySaver()
+    checkpointer = SqliteSaver(str(_DB_PATH))
+    return g.compile(checkpointer=checkpointer)
 
 
 def demo_fanout():
@@ -153,8 +164,9 @@ def demo_fanout():
     print("B. Map-Reduce 扇出（3 个子任务并行）")
     print("=" * 64)
     app = build_map_reduce()
+    cfg = {"thread_id": "article-43"}
     t0 = time.time()
-    out = app.invoke({"question": "固态电池产业", "subtasks": [], "findings": [], "report": ""})
+    out = app.invoke({"question": "固态电池产业", "subtasks": [], "findings": [], "report": ""}, cfg)
     cost = time.time() - t0
     print(out["report"])
     print(f"\n总耗时 {cost*1000:.0f} ms（串行应为 ~150ms，说明 3 个子任务在同一超步并发）")
