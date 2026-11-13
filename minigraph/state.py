@@ -90,12 +90,20 @@ class State(dict):
 
     reducers: dict[str, Reducer] = {}
 
+    # 每个字段的**类型**（`Annotated[list, add]` 里的 `list`）。
+    # 用途：通道的初值。LangGraph 用 typ() 给 reducer 字段一个零值初值
+    # （list->[]、int->0），于是节点读一个还没写过的字段拿到的是零值，
+    # 而不是 KeyError。没有类型就没法造初值 -> 退化成 MISSING。
+    field_types: dict[str, Any] = {}
+
     "父类在被子类继承的瞬间自动触发**，不是实例化对象的时候调用"
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         reducers: dict[str, Reducer] = {}
+        field_types: dict[str, Any] = {}
         for base in reversed(cls.__mro__[1:]):
             reducers.update(getattr(base, "reducers", {}))
+            field_types.update(getattr(base, "field_types", {}))
         # 注意：这里读 cls.__annotations__，不是 cls.__dict__["__annotations__"]。
         # Python 3.14 起 (PEP 649) 注解变成惰性求值，类字典里不再有
         # "__annotations__" 这一项 —— 用 __dict__ 取会拿到 None，于是 reducer
@@ -105,11 +113,18 @@ class State(dict):
             if name.startswith("_") or name == "reducers":
                 continue
             reducers[name] = _extract_reducer(ann) or LAST_VALUE
+            field_types[name] = _extract_type(ann)
         cls.reducers = reducers
+        cls.field_types = field_types
 
     @classmethod
     def schema(cls) -> dict[str, Reducer]:
         return dict(cls.reducers)
+
+    @classmethod
+    def types(cls) -> dict[str, Any]:
+        """每个字段的类型，用来给通道算初值。"""
+        return dict(cls.field_types)
 
 
 # 取一个类**自己**声明的注解，并把字符串注解解析回真实类型。
@@ -173,6 +188,20 @@ def _extract_reducer(ann) -> Reducer | None:
     return None
 
 
+def _extract_type(ann) -> Any:
+    """
+    从 `Annotated[T, ...]` 里取出 T（没有 Annotated 时，注解本身就是类型）。
+
+    用途只有一个：给通道算**初值**。LangGraph 的 reducer 字段初值是
+    `typ()`（list->[]、int->0），所以节点读一个还没写过的字段拿到的是零值。
+    解析不出来（字符串注解没解析成功、或者类型不可实例化）就返回原样，
+    由通道那边退化成 MISSING。
+    """
+    if getattr(ann, "__metadata__", None):
+        return getattr(ann, "__origin__", ann)
+    return ann
+
+
 # 把 StateGraph.__init__ 收到的 state_schema 参数归一化成 {字段: reducer}。
 #
 # 什么时候调用：
@@ -193,3 +222,20 @@ def _schema(obj: Mapping[str, Reducer] | type[State] | None) -> dict[str, Reduce
     if isinstance(obj, type) and issubclass(obj, State):
         return obj.schema()
     return dict(obj)
+
+
+def _schema_types(obj: Mapping[str, Reducer] | type[State] | None) -> dict[str, Any]:
+    """
+    取每个字段的**类型**（`Annotated[list, add]` 里的 `list`）。
+
+    用途是给通道算初值 —— LangGraph 的 reducer 字段初值是 `typ()`，
+    所以节点读一个还没写过的字段拿到的是零值而不是 KeyError。
+
+    只有 State 子类带得走类型信息：裸 dict 形态（`{field: reducer}`）里
+    没有类型，这时返回空 dict，通道退化成 MISSING 初值。
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, type) and issubclass(obj, State):
+        return obj.types()
+    return {}

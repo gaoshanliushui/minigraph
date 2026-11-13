@@ -163,11 +163,38 @@ def test_checkpoint_history_and_time_travel():
     history = app.get_state_history(cfg)
     assert [c.step for c in history] == [1, 2]
 
-    # 回到第 1 步的状态，改道再跑一次
+    # 回到第 1 步的状态，改道再跑一次。
+    # as_node = "a" 表示"假装是 a 写的" -> 被点亮的是 **a 的出边**（a -> b），
+    # 于是 b 被重新触发。对齐真实 LangGraph：update_state 跑的是 as_node 的
+    # writers（出边），不是 as_node 自己。
     first = history[0]
-    app.update_state({"thread_id": "t", "checkpoint_id": first.id}, {"trace": ["injected"]}, as_node="b")
+    app.update_state({"thread_id": "t", "checkpoint_id": first.id}, {"trace": ["injected"]}, as_node="a")
     out = app.invoke(None, {"thread_id": "t"})
     assert out["trace"] == ["a", "injected", "b"]
+
+
+def test_update_state_as_node_runs_the_successor_not_the_node():
+    """as_node 是终点节点时，图直接结束 —— 因为 b 的出边是 END。"""
+    class S(State):
+        trace: Annotated[list, operator.add]
+
+    g = StateGraph(S)
+    g.add_node("a", lambda s: {"trace": ["a"]})
+    g.add_node("b", lambda s: {"trace": ["b"]})
+    g.add_edge(START, "a")
+    g.add_edge("a", "b")
+    g.add_edge("b", END)
+    app = g.compile(checkpointer=InMemorySaver())
+    cfg = {"thread_id": "t"}
+    app.invoke({"trace": []}, cfg)
+
+    first = app.get_state_history(cfg)[0]
+    app.update_state({"thread_id": "t", "checkpoint_id": first.id},
+                     {"trace": ["injected"]}, as_node="b")
+    # b 的出边是 END -> 没有任何后继被点亮 -> 图到此为止
+    assert app.get_state(cfg).next == ()
+    out = app.invoke(None, {"thread_id": "t"})
+    assert out["trace"] == ["a", "injected"]
 
 
 # ---------------------------------------------------------------- 6. interrupt
@@ -395,6 +422,35 @@ def test_multiple_interrupts_resumed_one_by_one():
 
     out = app.invoke(None, {**cfg, "resume": "v3"})
     assert out["log"] == ["a:v2", "b:v3"]
+    assert app.get_state(cfg).interrupt is None
+
+
+def test_resume_payload_dict_is_passed_through_verbatim():
+    """
+    LangGraph 风格的答复：resume 的值本身是个 dict，原样交给 interrupt()。
+
+    真实 LangGraph 的 Command(resume=X) 里，interrupt() 拿到的就是 X 本身，
+    不做"键是不是节点名"的匹配。少了这条，{"action": "approve"} 这种
+    payload 会被误当成"按节点名批量答复"而静默丢掉 —— 节点原地再挂一次。
+    """
+
+    class S(State):
+        log: Annotated[list, operator.add]
+
+    def ask(s):
+        decision = interrupt({"请回复": "approve | reject"})
+        return {"log": [decision["action"]]}
+
+    g = StateGraph(S)
+    g.add_node("ask", ask)
+    g.add_edge(START, "ask")
+    g.add_edge("ask", END)
+
+    app = g.compile(InMemorySaver())
+    cfg = {"thread_id": "payload"}
+    app.invoke({"log": []}, cfg)
+    out = app.invoke(None, {**cfg, "resume": {"action": "approve"}})
+    assert out["log"] == ["approve"]
     assert app.get_state(cfg).interrupt is None
 
 

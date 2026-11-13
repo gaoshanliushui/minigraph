@@ -32,6 +32,38 @@ def test_reducer_determines_data_channel_type():
     assert isinstance(channel_for_field("n", operator.add), BinaryOperatorAggregate)
 
 
+def test_reducer_channel_starts_at_the_type_zero_value():
+    """
+    reducer 字段的通道初值是 typ()（list->[]、int->0），和 LangGraph 一致。
+
+    于是节点读一个**还没被写过**的字段拿到的是零值，而不是 KeyError；
+    拿不到类型时（比如裸 dict 形态声明的 schema）才退化成 MISSING。
+    """
+    ch = channel_for_field("log", operator.add, list)
+    assert ch.is_available()
+    assert ch.get() == []
+    assert channel_for_field("n", operator.add, int).get() == 0
+    # 没有类型 -> MISSING -> 不可用
+    assert not channel_for_field("x", operator.add).is_available()
+
+
+def test_reading_an_unwritten_reducer_field_yields_the_zero_value():
+    """节点读一个从没被写过的 reducer 字段：拿到零值，不是 KeyError。"""
+
+    class S(State):
+        n: Annotated[int, operator.add]
+        log: Annotated[list, operator.add]
+
+    g = StateGraph(S)
+    g.add_node("a", lambda s: {"log": list(s["log"]) + ["read"], "n": s["n"] + 1})
+    g.add_edge(START, "a")
+    g.add_edge("a", END)
+    app = g.compile()
+    out = app.invoke({})
+    assert out["log"] == ["read"]
+    assert out["n"] == 1
+
+
 def test_ephemeral_value_clears_and_barrier_rearms_after_consume():
     branch = EphemeralValue("branch:to:a", guard=False)
     assert branch.update([None]) is True

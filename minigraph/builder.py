@@ -31,7 +31,7 @@ from .channels import (
     channel_for_field,
 )
 from .constants import BRANCH_TO, END, JOIN, Reducer, START, TASKS
-from .state import State, _schema
+from .state import State, _schema, _schema_types
 
 if TYPE_CHECKING:  # 运行时真正 import 留给 .compile() 内部
     from .checkpoint import InMemorySaver
@@ -62,6 +62,9 @@ class NodeSpec:
 class StateGraph:
     def __init__(self, state_schema: Mapping[str, Reducer] | type[State] | None = None):
         self.reducers = _schema(state_schema)
+        # 字段类型：只用来给 reducer 通道算初值（typ()）。
+        # 裸 dict 形态声明的 schema 没有类型 -> 空 dict -> 通道退化成 MISSING。
+        self.field_types = _schema_types(state_schema)
         self.nodes: dict[str, dict[str, Any]] = {}
         self.edges: list[tuple[str, str]] = []
         # 多源汇聚边：add_edge(["a","b"], "c")
@@ -160,7 +163,8 @@ class StateGraph:
 
         # ① 数据通道：每个状态字段一个
         for field, reducer in self.reducers.items():
-            channels[field] = channel_for_field(field, reducer)
+            channels[field] = channel_for_field(field, reducer,
+                                                self.field_types.get(field))
 
         # ② 触发通道：每个节点一个 branch:to:X，节点订阅它
         for name in self.nodes:

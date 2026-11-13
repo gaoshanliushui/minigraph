@@ -184,10 +184,13 @@ class BinaryOperatorAggregate(BaseChannel):
     判定规则是「reducer 是恰好两个位置参数的 callable」——所以
     `operator.add` / `add_messages` / `merge_dict` 全都落进这一类。
 
-    关于初值：LangGraph 用 `typ()`（list->[]、int->0），这里用 MISSING。
-    差别在于 minigraph 的 reducer 约定 old 可能是 MISSING
-    （见 state.py 里 add_messages / merge_dict 对 MISSING 的处理）。
-    为了两种约定都成立，首次写入走「直接落盘」的捷径：
+    关于初值：用 `typ()`（list->[]、int->0），和 LangGraph 一致。
+    于是字段**一开始就有值**，节点读一个还没被写过的字段拿到的是零值，
+    而不是 KeyError；`get_state()` 的状态投影也因此和 LangGraph 一样
+    带着这些零值字段。
+
+    拿不到类型时（裸 dict 形态声明的 schema、类型不可实例化）退化成
+    MISSING —— 此时首次写入走「直接落盘」的捷径：
 
         value = values[0]        # 等价于 reducer(MISSING, values[0])
 
@@ -195,12 +198,21 @@ class BinaryOperatorAggregate(BaseChannel):
     reducer(MISSING, v) 的结果一致。
     """
 
-    __slots__ = ("value", "operator")
+    __slots__ = ("value", "operator", "typ")
 
-    def __init__(self, key: str = "", operator: Reducer | None = None):
+    def __init__(self, key: str = "", operator: Reducer | None = None,
+                 typ: Any = None):
         super().__init__(key)
         self.value: Any = MISSING
         self.operator = operator
+        self.typ = typ
+        # 初值 = typ()：list->[]、int->0、dict->{}
+        # 类型造不出零值（泛型别名、抽象类型）就退回 MISSING。
+        if typ is not None:
+            try:
+                self.value = typ()
+            except Exception:  # noqa: BLE001 - 造不出零值就当没类型
+                self.value = MISSING
 
     def update(self, values: Sequence[Any]) -> bool:
         if len(values) == 0:
@@ -225,7 +237,7 @@ class BinaryOperatorAggregate(BaseChannel):
         return self.value
 
     def from_checkpoint(self, checkpoint: Any) -> "BinaryOperatorAggregate":
-        empty = BinaryOperatorAggregate(self.key, self.operator)
+        empty = BinaryOperatorAggregate(self.key, self.operator, self.typ)
         if checkpoint is not MISSING:
             empty.value = checkpoint
         return empty
@@ -403,7 +415,8 @@ class NamedBarrierValue(BaseChannel):
 # 状态字段 -> 数据通道
 # ---------------------------------------------------------------------------
 
-def channel_for_field(field: str, reducer: Reducer | None) -> BaseChannel:
+def channel_for_field(field: str, reducer: Reducer | None,
+                      typ: Any = None) -> BaseChannel:
     """
     把一个状态字段映射成对应的数据通道。
 
@@ -417,7 +430,10 @@ def channel_for_field(field: str, reducer: Reducer | None) -> BaseChannel:
     也登记成 reducers[field] = LAST_VALUE（而不是 None）。LAST_VALUE 本身
     就是"后写覆盖"，语义上等同于"没有 reducer"，所以要归到 LastValue 通道 ——
     它能在一步收到多个值时报错，而 BinaryOperatorAggregate 会静默取最后一个。
+
+    `typ` 是字段的类型（`Annotated[list, add]` 里的 `list`），只给
+    BinaryOperatorAggregate 用：它决定通道的初值 `typ()`。
     """
     if reducer is None or reducer is LAST_VALUE:
         return LastValue(field)
-    return BinaryOperatorAggregate(field, reducer)
+    return BinaryOperatorAggregate(field, reducer, typ)

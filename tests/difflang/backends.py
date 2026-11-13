@@ -19,8 +19,10 @@ from typing import Any
 # minigraph 侧
 # ---------------------------------------------------------------------------
 from minigraph.builder import StateGraph as MiniStateGraph
+from minigraph.checkpoint import InMemorySaver as MiniSaver
 from minigraph.constants import END as MINI_END
 from minigraph.constants import START as MINI_START
+from minigraph.context import interrupt as mini_interrupt
 from minigraph.control import Command as MiniCommand
 from minigraph.control import Send as MiniSend
 from minigraph.state import State as MiniState
@@ -29,11 +31,13 @@ from minigraph.state import State as MiniState
 # LangGraph 侧
 # ---------------------------------------------------------------------------
 try:
+    from langgraph.checkpoint.memory import InMemorySaver as LGSaver
     from langgraph.graph import END as LG_END
     from langgraph.graph import START as LG_START
     from langgraph.graph import StateGraph as LGStateGraph
     from langgraph.types import Command as LGCommand
     from langgraph.types import Send as LGSend
+    from langgraph.types import interrupt as lg_interrupt
     from typing import TypedDict
 
     HAS_LANGGRAPH = True
@@ -52,6 +56,9 @@ class Backend:
     Command: Any
     START: str
     END: str
+    # 检查点相关： saver 类型 + interrupt 的来源模块
+    checkpointer_cls: Any = None
+    interrupt: Any = None
 
     def make_state(self, annotations: dict[str, Any]) -> Any:
         """
@@ -67,6 +74,46 @@ class Backend:
         # LangGraph 用 TypedDict，get_type_hints(include_extras=True) 读注解
         return TypedDict("S", dict(annotations))  # type: ignore[misc]
 
+    # -- 检查点相关的形状差异 ---------------------------------------------
+    def config(self, thread_id: str, **extra) -> dict:
+        """
+        造出这一套后端的 config。
+
+        minigraph 把 thread_id 放在顶层；LangGraph 放在 configurable 里。
+        """
+        if self.name == "minigraph":
+            return {"thread_id": thread_id, **extra}
+        return {"configurable": {"thread_id": thread_id}, **extra}
+
+    def resume(self, app: Any, thread_id: str, value: Any) -> Any:
+        """
+        答复挂起的中断，让图继续跑。
+
+        minigraph 从 config['resume'] 取值；LangGraph 从 Command(resume=) 取。
+        """
+        if self.name == "minigraph":
+            return app.invoke(None, {"thread_id": thread_id, "resume": value})
+        return app.invoke(self.Command(resume=value),
+                          {"configurable": {"thread_id": thread_id}})
+
+    def history(self, app: Any, cfg: dict) -> list[tuple[int, dict]]:
+        """
+        历史快照统一成 [(step, 可直接喂回 update_state 的 config)]。
+
+        两边形状不同：minigraph 的快照是 Checkpoint 对象、config 形如
+        {"thread_id":..., "checkpoint_id":...}；LangGraph 的是 StateSnapshot，
+        config 藏在 snapshot.config["configurable"] 里。
+        """
+        if self.name == "minigraph":
+            tid = cfg["thread_id"]
+            return [(c.step, {"thread_id": tid, "checkpoint_id": c.id})
+                    for c in app.get_state_history(cfg)]
+        out: list[tuple[int, dict]] = []
+        for snap in app.get_state_history(cfg):
+            conf = dict(snap.config["configurable"])
+            out.append((snap.metadata["step"], {"configurable": conf}))
+        return out
+
 
 MINIGRAPH = Backend(
     name="minigraph",
@@ -76,6 +123,8 @@ MINIGRAPH = Backend(
     Command=MiniCommand,
     START=MINI_START,
     END=MINI_END,
+    checkpointer_cls=MiniSaver,
+    interrupt=mini_interrupt,
 )
 
 LANGGRAPH = Backend(
@@ -86,4 +135,6 @@ LANGGRAPH = Backend(
     Command=LGCommand if HAS_LANGGRAPH else None,
     START=LG_START if HAS_LANGGRAPH else "",
     END=LG_END if HAS_LANGGRAPH else "",
+    checkpointer_cls=LGSaver if HAS_LANGGRAPH else None,
+    interrupt=lg_interrupt if HAS_LANGGRAPH else None,
 )

@@ -214,6 +214,8 @@ class CompiledGraph:
     def __init__(self, graph: StateGraph, checkpointer: InMemorySaver | None = None):
         self.graph = graph
         self.reducers = graph.reducers
+        # 字段类型：给 reducer 通道算初值（typ()）。裸 dict 形态的 schema 没有。
+        self.field_types = graph.field_types
         self.checkpointer = checkpointer
         # 编译产物：通道表 + 节点规格表
         self.channels, self.nodes = graph._compile()
@@ -275,48 +277,113 @@ class CompiledGraph:
         """
         人工改写状态并生成新 checkpoint（LangGraph 的 update_state）。
 
-        在通道模型下，"改写状态"= 往状态通道里写（走各自的 reducer）；
-        as_node 指定"假装是哪个节点写的"，决定接下来从哪继续 ——
-        做法是写 branch:to:<as_node> 推进它的版本（保证它被触发），
-        同时把其他节点的 versions_seen 补齐到当前版本（让它们不被触发）。
+        在通道模型下，"改写状态"= 往状态通道里写（走各自的 reducer）。
+
+        `as_node` 表示"假装这条更新是**哪个节点写的"。既然是它写的，
+        被点亮的就是**它的出边**，而不是它自己：
+
+          - 静态边 -> 写 branch:to:<后继>
+          - 条件边 -> 按**合并后**的状态重新求值，写被选中的目标
+
+        于是接下来跑的是 as_node 的**后继**。
+        （对齐真实 LangGraph：update_state 执行的是 as_node 的 writers，
+        不是 as_node 自己 —— 详见 langgraph/pregel/main.py 的
+        bulk_update_state：`writers = self.nodes[as_node].flat_writers`。）
+
+        不给 as_node 时，按水位线推断"最后一个写过状态的节点"
+        （对齐 LangGraph 的 _infer_as_node）；几个节点同时写过、说不清是谁
+        写的，就报错请显式指定。
         """
         thread_id = config["thread_id"]
         if not self.checkpointer:
             raise ValueError("update_state 需要 checkpointer")
-        snap = self.get_state(config).copy()
+        snap = self.checkpointer.get(thread_id, config.get("checkpoint_id"))
+        if snap is None:
+            # LangGraph 允许在还没有快照的 thread 上 update_state：
+            # 以空快照为底，这次的 values 就是初始状态。
+            snap = Checkpoint(id=self.checkpointer.new_id(), step=-1,
+                              values={}, next=(), tasks=[])
+        else:
+            snap = snap.copy()
 
         channels, versions, seen = self._restore_channels(snap)
         extra_values = {k: v for k, v in snap.values.items() if k not in self.reducers}
         # ① 把 values 写进状态通道
-        _write_state_channels(self.reducers, channels, values, node=as_node or "<update_state>")
+        _write_state_channels(self.reducers, channels, values,
+                              node=as_node or "<update_state>",
+                              types=self.field_types)
 
         # ② 决定"接下来跑谁"
-        if as_node:
-            if as_node not in self.nodes:
-                raise ValueError(f"未知节点 {as_node!r}")
-            chan = BRANCH_TO.format(as_node)
-            channels[chan].update([None])
-            versions[chan] = _next_version(versions)
-            # 其他节点的水位线补齐 -> 它们不会触发
-            current = max(versions.values(), default=0)
-            for name, spec in self.nodes.items():
-                if name == as_node:
-                    continue
-                seen.setdefault(name, {}).update(
-                    {c: versions.get(c, current) for c in spec.triggers}
+        if as_node is None:
+            as_node = self._infer_as_node(seen)
+            if as_node is None:
+                raise ValueError(
+                    "无法推断 as_node（多个节点同时写过状态）；请显式指定 as_node"
                 )
+        if as_node not in self.nodes:
+            raise ValueError(f"未知节点 {as_node!r}")
+        spec = self.nodes[as_node]
+
+        # ③ 点亮 as_node 的出边。条件边看到的是「values 合并进旧状态之后」
+        #    的视图 —— 和节点正常跑完时看到的是同一份东西。
+        writes = _control_writes(spec, dict(snap.values), values,
+                                 channels, self.reducers)
+        next_version = _next_version(versions)
+        updated = _apply_writes(channels, versions,
+                                [(as_node, c, v) for c, v in writes],
+                                next_version=next_version)
+
+        # ④ 本次更新没写到的触发通道自清。否则上一次挂起留下的旧信号会把
+        #    无关节点也唤醒（对齐 apply_writes 的 "channels that weren't
+        #    updated in this step are notified of a new step"）。
+        rt = _RuntimeState(
+            nodes=self.nodes, reducers=self.reducers, channels=channels,
+            versions=versions, seen=seen, extra=extra_values,
+            updated=set(updated), step=snap.step,
+        )
+        rt.expire_unwritten({c for c, _ in writes}, next_version)
+
+        # ⑤ next = 被这次写入点亮的节点（as_node 自己不会被点亮）
+        upcoming = self._next_tasks(rt)
 
         snap.id = self.checkpointer.new_id()
         snap.step += 1
         snap.interrupt = None
-        snap.values = _state_projection(channels, self.reducers)
+        snap.interrupts = []
+        snap.resumes = {}
+        snap.values = _state_projection(channels, self.reducers, extra_values)
         snap.channel_values = {c: ch.checkpoint() for c, ch in channels.items()}
         snap.channel_versions = dict(versions)
         snap.versions_seen = {k: dict(v) for k, v in seen.items()}
-        snap.next = (as_node,) if as_node else snap.next
-        snap.tasks = [as_node] if as_node else snap.tasks
+        snap.next = tuple(t.name for t in upcoming)
+        snap.tasks = [t.send if t.is_push else t.name for t in upcoming]
         self.checkpointer.put(thread_id, snap)
         return snap.id
+
+    def _infer_as_node(self, seen: dict[str, dict[str, int]]) -> str | None:
+        """
+        推断"最后一个写过状态的节点"（对齐 LangGraph 的 _infer_as_node）。
+
+        判据：节点水位线里**最高的那个版本**属于谁，谁就是最后跑的那个。
+        最高版本有两个节点并列 -> 说不清是谁写的 -> 返回 None，
+        让调用方要求显式指定 as_node。
+
+        一个节点都还没跑过时，入口伪节点 __start__ 算"最后写的那个"
+        （它的出边就是所有入口点）。
+        """
+        if len(self.nodes) == 1:
+            return next(iter(self.nodes))
+        marks = sorted(
+            (v, name)
+            for name, node_seen in seen.items()
+            if name in self.nodes
+            for v in node_seen.values()
+        )
+        if not marks:
+            return START if START in self.nodes else None
+        if len(marks) == 1 or marks[-1][0] != marks[-2][0]:
+            return marks[-1][1]
+        return None
 
     # -- 通道状态的恢复 -----------------------------------------------------
     def _restore_channels(self, snap: Checkpoint):
@@ -403,6 +470,7 @@ class CompiledGraph:
             reducers, channels,
             {k: v for k, v in raw.items() if k in reducers},
             node=START,
+            types=self.field_types,
         )
         rt = _RuntimeState(
             nodes=self.nodes, reducers=reducers,
@@ -649,28 +717,45 @@ def _merge_resume(store: dict[str, list[Any]], pending: list[dict[str, Any]],
     """
     把用户带来的 resume 值并进"槽位 -> 值队列"。
 
-    `value` 有两种形态：
+    `value` 有三种形态：
 
       - **标量**：给第一个待恢复的中断（对齐 LangGraph 的
         "a single value with which to resume the next interrupt"）。
-      - **字典**：键可以是槽位（"b@2#push:1"）或节点名（"b"）。
-        节点名会命中该节点**所有**待恢复的槽位。
+      - **字典，键是槽位（"b@2#push:1"）或节点名（"b"）**：minigraph 的扩展，
+        一次答复多个挂起点。节点名会命中该节点**所有**待恢复的槽位；
         值本身可以是列表 —— 对应"一个节点里连续多次 interrupt()"。
+      - **字典，键对不上任何节点名/槽位**：整个字典就是**一个**答复值，
+        原样交给 interrupt()。
+
+    第三种是 LangGraph 那边最常见的用法：中断的请求本身是个 dict
+    （`{"action": "approve"}`），`Command(resume=X)` 里 interrupt() 拿到的
+    就是 X 本身（对齐真实 LangGraph：resume 值**原样透传**，不做节点匹配）。
+    少了这一条，LangGraph 风格的答复会被当成"按节点名批量答复"而**静默丢掉**
+    —— 节点于是原地再挂起一次，看起来像"答复没生效"。
+
+    代价是有一个歧义：payload 的键**恰好**叫某个待恢复节点名时，
+    按扩展解释（键 = 节点名）。这是有意取舍 —— 扩展是文档化的一等公民。
 
     队列而不是单值：整步回滚会让节点重跑，已经答复过的值必须留着；
     一个节点多次 interrupt() 时也要按调用顺序逐个取。
     """
     if isinstance(value, Mapping):
-        for key, val in value.items():
-            targets = [p for p in pending if p["slot"] == key] or \
-                      [p for p in pending if p["node"] == key]
-            for p in targets:
-                queue = store.setdefault(p["slot"], [])
-                if isinstance(val, (list, tuple)):
-                    queue.extend(val)
-                else:
-                    queue.append(val)
-        return store
+        # 只有键真的对得上某个待恢复的节点/槽位，才按"批量答复"解释。
+        matched = [k for k in value
+                   if any(p["slot"] == k or p["node"] == k for p in pending)]
+        if matched:
+            for key in matched:
+                val = value[key]
+                targets = [p for p in pending if p["slot"] == key] or \
+                          [p for p in pending if p["node"] == key]
+                for p in targets:
+                    queue = store.setdefault(p["slot"], [])
+                    if isinstance(val, (list, tuple)):
+                        queue.extend(val)
+                    else:
+                        queue.append(val)
+            return store
+        # 键对不上 -> 整个字典是一个答复值，原样透传给 interrupt()
     for p in pending:
         store.setdefault(p["slot"], []).append(value)
         break
@@ -830,7 +915,8 @@ def _state_projection(channels: dict[str, BaseChannel],
 
 
 def _write_state_channels(reducers: Mapping[str, Reducer], channels: dict[str, BaseChannel],
-                          update: dict, *, node: str) -> None:
+                          update: dict, *, node: str,
+                          types: Mapping[str, Any] | None = None) -> None:
     """
     把 update 写进状态通道（走各自的 reducer）。
 
@@ -843,7 +929,7 @@ def _write_state_channels(reducers: Mapping[str, Reducer], channels: dict[str, B
             )
         ch = channels.get(key)
         if ch is None:
-            ch = channel_for_field(key, reducers[key])
+            ch = channel_for_field(key, reducers[key], (types or {}).get(key))
             channels[key] = ch
         ch.update([val])
 
