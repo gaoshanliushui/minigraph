@@ -4,6 +4,7 @@
 > **channel 写入 + 通道版本 + 节点水位线**。
 >
 > 配套阅读：《`runtime超步循环详解.md`》（讲超步循环怎么用这些通道）、
+> 《`versions与seen水位线详解.md`》（版本号与水位线什么时候被改）、
 > `minigraph/channels.py`（实现）、`scripts/channel_availability.py`（可运行的实测）。
 
 ---
