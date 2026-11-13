@@ -97,7 +97,7 @@ def demo_hitl():
     print("A. Human-in-the-loop")
     print("=" * 64)
     app = build_draft_graph()
-    cfg = {"thread_id": "article-42"}
+    cfg = {"thread_id": "article-42", "debug": True}
 
     s = app.invoke({"topic": "硬核财经", "draft": "", "feedback": [], "status": ""}, cfg)
     print(f"第一次运行后 status={s['status']!r}，图已冻结：{app.interrupted}")
@@ -164,7 +164,7 @@ def demo_fanout():
     print("B. Map-Reduce 扇出（3 个子任务并行）")
     print("=" * 64)
     app = build_map_reduce()
-    cfg = {"thread_id": "article-43"}
+    cfg = {"thread_id": "article-43", "debug": True}
     t0 = time.time()
     out = app.invoke({"question": "固态电池产业", "subtasks": [], "findings": [], "report": ""}, cfg)
     cost = time.time() - t0
