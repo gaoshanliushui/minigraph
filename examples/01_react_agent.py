@@ -23,6 +23,7 @@ from typing import Annotated
 
 from minigraph.builder import StateGraph
 from minigraph.checkpoint import InMemorySaver
+from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.constants import END, START
 from minigraph.state import State, add_messages
 
@@ -93,7 +94,9 @@ def build():
     g.add_edge(START, "agent")
     g.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
     g.add_edge("tools", "agent")      # 关键：工具执行完回到模型，形成循环
-    return g.compile(checkpointer=InMemorySaver())
+    # checkpointer = InMemorySaver()
+    checkpointer =  SqliteSaver(str("../minigraph.db"))
+    return g.compile(checkpointer=checkpointer)
 
 
 if __name__ == "__main__":
