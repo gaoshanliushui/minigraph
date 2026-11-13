@@ -6,13 +6,14 @@
 跑法：
     .venv/bin/python scripts/versions_seen_trace.py
 
-这个脚本跑四个场景，每个场景都打印每超步的
+这个脚本跑五个场景，每个场景都打印每超步的
 versions / seen / avail 快照：
 
     1. 线性链 a -> b            —— 通道自清 + 节点水位线
     2. 回边 agent -> tools -> agent —— 水位线落后一格，循环才转得起来
     3. 屏障 a+b -> c            —— 屏障凑齐才触发，触发后重新武装
     4. Send 扇出                 —— PUSH 不推进目标节点的水位线
+    5. Map-Reduce 扇出            —— 文档 §5 的完整实例
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import operator
 from typing import Annotated
 
 from minigraph.builder import StateGraph
+from minigraph.constants import END
 from minigraph.control import Send
 from minigraph.state import State
 
@@ -234,12 +236,62 @@ def check_invariants() -> None:
     print(f"  {'✓' if ok else '✗'} 循环里 agent 的水位线落后于版本（燃料存在）")
 
 
+# ---------------------------------------------------------------------------
+# 场景 5：Map-Reduce 扇出（文档 §5 的完整实例）
+# ---------------------------------------------------------------------------
+
+class S5(State):
+    question: str
+    subtasks: Annotated[list, operator.add]
+    findings: Annotated[list, operator.add]
+    report: str
+
+
+def scenario_map_reduce() -> None:
+    section("场景 5：Map-Reduce 扇出（文档 §5 的完整实例）")
+    print("预期：seen['research_one'] = {}（空）—— PUSH 不推进目标节点水位线")
+    print("      branch:to:research_one 全程 0 —— Send 绕开分支通道")
+    print("      branch:to:report 被写 3 次，但只推一个版本号")
+
+    def split(state):
+        return {"subtasks": ["市场规模", "竞争格局", "监管风险"]}
+
+    def dispatch(state):
+        return [Send("research_one", {"question": state["question"], "aspect": t})
+                for t in state["subtasks"]]
+
+    def research_one(state):
+        return {"findings": [f"[{state['aspect']}] 关于「{state['question']}」的调研结论"]}
+
+    def reduce_report(state):
+        body = "\n".join(f"- {f}" for f in sorted(state["findings"]))
+        return {"report": f"# {state['question']}\n\n{body}"}
+
+    g = StateGraph(S5)
+    g.add_node("split", split)
+    g.add_node("dispatch", dispatch)
+    g.add_node("research_one", research_one)
+    g.add_node("report", reduce_report)
+    g.add_edge("__start__", "split")
+    g.add_edge("split", "dispatch")
+    g.add_edge("dispatch", "research_one")
+    g.add_edge("research_one", "report")
+    g.add_edge("report", END)
+    app = g.compile()
+    for _ in app.stream(
+        {"question": "固态电池产业", "subtasks": [], "findings": [], "report": ""},
+        {"debug": True},
+    ):
+        pass
+
+
 def main() -> None:
     instrument()
     scenario_linear()
     scenario_loop()
     scenario_barrier()
     scenario_send()
+    scenario_map_reduce()
     check_invariants()
     print()
 

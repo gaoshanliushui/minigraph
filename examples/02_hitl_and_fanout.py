@@ -99,6 +99,8 @@ def demo_hitl():
     app = build_draft_graph()
     cfg = {"thread_id": "article-42", "debug": True}
 
+    print_graph(app)
+
     s = app.invoke({"topic": "硬核财经", "draft": "", "feedback": [], "status": ""}, cfg)
     print(f"第一次运行后 status={s['status']!r}，图已冻结：{app.interrupted}")
     print("  checkpoint 数 =", len(app.get_state_history(cfg)))
@@ -165,13 +167,32 @@ def demo_fanout():
     print("=" * 64)
     app = build_map_reduce()
     cfg = {"thread_id": "article-43", "debug": True}
+    print_graph(app)
+
     t0 = time.time()
     out = app.invoke({"question": "固态电池产业", "subtasks": [], "findings": [], "report": ""}, cfg)
     cost = time.time() - t0
     print(out["report"])
     print(f"\n总耗时 {cost*1000:.0f} ms（串行应为 ~150ms，说明 3 个子任务在同一超步并发）")
 
+def print_graph(app):
+    print("=== compiled channels (control-flow channels) ===")
+    for k, v in app.channels.items():
+        print(f"  {k!r:24} -> {type(v).__name__}")
+    print()
+
+    print("=== node : triggers / writers ===")
+    for name, spec in app.nodes.items():
+        print(f"  [{name}]")
+        print("    triggers =", spec.triggers)
+        print("    writers  =", spec.writers)
+
+        if spec.branches:
+            print("    branches =", [b["source"] for b in spec.branches])
+        if spec.is_start:
+            print("    (入口伪节点)")
+        print()
 
 if __name__ == "__main__":
-    demo_hitl()
+    # demo_hitl()
     demo_fanout()

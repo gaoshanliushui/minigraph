@@ -37,6 +37,12 @@ and versions.get(chan, 0) > seen.get(chan, 0)     # 版本比这个节点的水�
 
 **关键**：两张表**独立前进**，谁也不等谁。这是理解全部困惑的钥匙。
 
+> **怎么读这篇文档**：
+> §1–§3 是规则（谁在什么时候改哪张表），
+> §4 是两个最小场景的完整时间线，
+> §5 是**一条真实日志的逐行解读**（Map-Reduce 扇出）—— 第一次读可以直接跳到 §5。
+> §6 是速查问答，§8 是一页表格。
+
 ---
 
 ## 1. `versions`：通道版本号
@@ -523,7 +529,285 @@ step 3 是关键：`versions["branch:to:agent"] = 3`，
 
 ---
 
-## 5. 常见困惑速查
+## 5. 完整实例：Map-Reduce 扇出逐行解读
+
+这一节把前面所有规则用**一条真实日志**串起来。
+图来自 `examples/02_hitl_and_fanout.py` 的 B 段（Map-Reduce 扇出）。
+
+### 5.1 图和编译产物
+
+```text
+__start__ → split → dispatch → research_one ×3 → report → END
+```
+
+编译成通道和订阅关系：
+
+| 节点 | triggers（订阅，能被谁唤醒） | writers（写） |
+| --- | --- | --- |
+| `split` | `branch:to:split` | `branch:to:dispatch` |
+| `dispatch` | `branch:to:dispatch` | `__pregel_tasks`（Send 队列） |
+| `research_one` | `branch:to:research_one` | `branch:to:report` |
+| `report` | `branch:to:report` | —（出边是 END，不需要通道） |
+
+> ⚠️ `research_one` 虽然订阅了 `branch:to:research_one`，但那条通道**从头到尾没人写**（版本一直是 0）——
+> 因为 `dispatch` 写的是 `__pregel_tasks`（Send），不是 `branch:to:research_one`。
+> 静态边 `add_edge("dispatch", "research_one")` 在这里只是**为了让图不悬空**，
+> 真正唤醒 `research_one` 的是 Send。
+
+节点代码（`examples/02_hitl_and_fanout.py:124-142`）：
+
+```python
+def split(state):
+    return {"subtasks": ["市场规模", "竞争格局", "监管风险"]}
+
+def dispatch(state):
+    """返回 list[Send]：每个子任务一份独立输入，下一超步并行执行。"""
+    return [Send("research_one", {"question": state["question"], "aspect": t})
+            for t in state["subtasks"]]
+
+def research_one(state):
+    time.sleep(0.05)
+    return {"findings": [f"[{state['aspect']}] 关于「{state['question']}」的调研结论"]}
+
+def reduce_report(state):
+    body = "\n".join(f"- {f}" for f in sorted(state["findings"]))
+    return {"report": f"# {state['question']}\n\n{body}"}
+```
+
+### 5.2 完整日志
+
+```text
+step 1 触发前
+  versions: {'__pregel_tasks': 0, '__start__': 0, 'branch:to:dispatch': 0, 'branch:to:report': 0, 'branch:to:research_one': 0, 'branch:to:split': 1}
+  seen    : {'__start__': {'__start__': 0}}
+  avail   : {'branch:to:split': None}
+step 1: ['split'] -> changed=['subtasks', 'branch:to:dispatch']
+step 2 触发前
+  versions: {'__pregel_tasks': 0, '__start__': 0, 'branch:to:dispatch': 2, 'branch:to:report': 0, 'branch:to:research_one': 0, 'branch:to:split': 2}
+  seen    : {'__start__': {'__start__': 0}, 'split': {'branch:to:split': 1}}
+  avail   : {'branch:to:dispatch': None}
+step 2: ['dispatch'] -> changed=['__pregel_tasks', '__pregel_tasks', '__pregel_tasks']
+step 3 触发前
+  versions: {'__pregel_tasks': 3, '__start__': 0, 'branch:to:dispatch': 3, 'branch:to:report': 0, 'branch:to:research_one': 0, 'branch:to:split': 2}
+  seen    : {'__start__': {'__start__': 0}, 'dispatch': {'branch:to:dispatch': 2}, 'split': {'branch:to:split': 1}}
+  avail   : {'__pregel_tasks': [Send(node='research_one', arg={'question': '固态电池产业', 'aspect': '市场规模'}), Send(node='research_one', arg={'question': '固态电池产业', 'aspect': '竞争格局'}), Send(node='research_one', arg={'question': '固态电池产业', 'aspect': '监管风险'})]}
+step 3: ['research_one', 'research_one', 'research_one'] -> changed=['findings', 'branch:to:report', 'findings', 'branch:to:report', 'findings', 'branch:to:report']
+step 4 触发前
+  versions: {'__pregel_tasks': 4, '__start__': 0, 'branch:to:dispatch': 3, 'branch:to:report': 4, 'branch:to:research_one': 0, 'branch:to:split': 2}
+  seen    : {'__start__': {'__start__': 0}, 'dispatch': {'branch:to:dispatch': 2}, 'research_one': {}, 'split': {'branch:to:split': 1}}
+  avail   : {'branch:to:report': None}
+step 4: ['report'] -> changed=['report']
+```
+
+### 5.3 逐超步拆解
+
+#### Step 1 触发前 —— 开局
+
+```text
+versions: {..., 'branch:to:split': 1, 'branch:to:dispatch': 0, ...}
+seen    : {'__start__': {'__start__': 0}}
+avail   : {'branch:to:split': None}
+```
+
+开局状态（`_begin`，`runtime.py:463-493`）：
+
+- 所有通道版本 = 0。
+- `__start__` 的唯一工作是"点亮所有入口点"。唯一入口是 `split`，
+  所以它写 `branch:to:split`，版本 → **1**。
+- `seen["__start__"] = {"__start__": 0}` —— `__start__` 记下自己看过
+  `__start__` 通道的第 0 版，免得重复触发。
+- `avail` 里只有 `branch:to:split`。`EphemeralValue` 存的值是 `None`，
+  但**被写过就算"可用"** —— 值是什么不重要，重要的是"被写过"。
+
+**算触发**：`split` 的 `seen.get("split")` 是 `None` → 从没跑过 → 通道可用 → ✓ 触发。
+
+#### Step 1 —— `split` 跑
+
+```text
+step 1: ['split'] -> changed=['subtasks', 'branch:to:dispatch']
+```
+
+`split` 返回 `{"subtasks": [...]}`；它的出边让它再写 `branch:to:dispatch`。
+
+落盘四步：
+
+| 步 | 动作 | 结果 |
+| --- | --- | --- |
+| ① `advance_watermarks` | `split` 记水位线 | `seen["split"] = {"branch:to:split": 1}` ← **写入前**的版本 |
+| ② `next_version` | | 2 |
+| ③ `consume_triggers` | `branch:to:split` 是 ephemeral，`consume()` 返回 False | 版本不动 |
+| ④ `_apply_writes` | `subtasks`、`branch:to:dispatch` 变了 | `versions["branch:to:dispatch"] = 2` |
+| ⑤ `expire_unwritten` | `branch:to:split` 本步没人写 → `update([])` 自清 | `versions["branch:to:split"] = 2` |
+
+#### Step 2 触发前
+
+```text
+versions: {..., 'branch:to:dispatch': 2, 'branch:to:split': 2}
+seen    : {..., 'split': {'branch:to:split': 1}}
+avail   : {'branch:to:dispatch': None}
+```
+
+**两个关键点：**
+
+**① `split` 没有被再次触发。** 它的触发通道 `branch:to:split`：
+- 版本 2 > 水位线 1 ✓ 版本是新的
+- 但通道**已被自清**，`is_available()` 为 False ✗
+
+**两个条件是"与"的关系，缺一不可** —— 版本推进了不代表会触发。
+
+**② `branch:to:split` 的版本是 2 而不是 1。** 尽管它从 step 2 起再没被写过，
+但自清也算一次变化，照样推版本。这样任何节点的水位线都追不上一个已被清空的通道。
+
+**算触发**：`dispatch` 从没跑过 → `branch:to:dispatch` 可用 → ✓ 触发。
+
+#### Step 2 —— `dispatch` 跑（Send 登场）
+
+```text
+step 2: ['dispatch'] -> changed=['__pregel_tasks', '__pregel_tasks', '__pregel_tasks']
+```
+
+`dispatch` 返回 `list[Send]`，三个 Send 包被写进保留通道 `__pregel_tasks`。
+
+`changed` 里 `__pregel_tasks` 出现**三次** —— 三个 Send 各算一次写入。
+
+落盘：
+
+| 步 | 动作 | 结果 |
+| --- | --- | --- |
+| ① | `dispatch` 记水位线 | `seen["dispatch"] = {"branch:to:dispatch": 2}` |
+| ④ | 写 `__pregel_tasks` ×3 | `versions["__pregel_tasks"] = 3` |
+| ⑤ | `branch:to:dispatch` 没人写 → 自清 | `versions["branch:to:dispatch"] = 3` |
+
+**注意 `branch:to:research_one` 的版本一直是 0** —— Send 走 `__pregel_tasks`，
+**完全绕开了分支通道**。
+
+#### Step 3 触发前 —— PUSH 轨道
+
+```text
+versions: {..., '__pregel_tasks': 3, 'branch:to:research_one': 0}
+avail   : {'__pregel_tasks': [Send(...), Send(...), Send(...)]}
+```
+
+`avail` 里 `__pregel_tasks` 的值是三个 Send 包 —— 这是 `Topic` 通道，存的是列表。
+
+**触发是怎么发生的**（`_prepare_next_tasks`，`runtime.py:808-816`）：
+
+```python
+tc = channels.get(TASKS)
+if tc is not None and tc.is_available():
+    for idx, packet in enumerate(tc.get()):
+        if isinstance(packet, Send):
+            tasks.append(Task(name=packet.node, send=packet, idx=idx))
+```
+
+**Send 任务根本不走版本判定** —— 只要 `__pregel_tasks` 里有 Send 包，就变成任务。
+所以 `research_one` 被触发了，尽管 `branch:to:research_one` 的版本是 0（从没被写过）。
+
+反过来说，`research_one` 在 PULL 轨上也不会被选中：
+它只订阅 `branch:to:research_one`，那通道从没被写过（版本 0），
+`seen` 里也没有它 —— 版本判定不成立。
+
+#### Step 3 —— `research_one` ×3 并行跑
+
+```text
+step 3: ['research_one', 'research_one', 'research_one']
+  -> changed=['findings', 'branch:to:report', 'findings', 'branch:to:report', 'findings', 'branch:to:report']
+```
+
+三个 `research_one` 在同一超步内**并发**执行（`ThreadPoolExecutor`，`runtime.py:972`），
+每个都写 `findings` 和 `branch:to:report`。
+
+并发写不冲突，因为：
+- `findings` 配了 `operator.add` → `BinaryOperatorAggregate`；
+- `branch:to:report` 是 `EphemeralValue(guard=False)` —— guard=False 允许一步收多个值，
+  因为"两个并行节点同时 `Command(goto='x')`"是合法的。
+
+**`seen` 的关键变化：**
+
+```python
+if task.is_push:
+    self.seen.setdefault(task.name, {})   # 建个空条目，但不推进水位线
+    continue
+```
+
+```text
+seen: {..., 'research_one': {}, ...}
+```
+
+**`seen["research_one"] = {}` 是空字典！** PUSH 任务**不推进**目标节点的水位线 ——
+Send 的触发源是保留通道 `__pregel_tasks`，不是目标节点的 `branch:to:research_one`；
+推进 `branch:to:research_one` 的水位线等于凭空抹掉一个还没发生过的信号。
+（真实 LangGraph 同样如此。）
+
+落盘：
+
+| 步 | 动作 | 结果 |
+| --- | --- | --- |
+| ① | 三个 PUSH 任务 → `setdefault` 空条目 | `seen["research_one"] = {}` |
+| ④ | `findings`、`branch:to:report` 被写 | `versions["branch:to:report"] = 4` |
+| ⑤ | `branch:to:dispatch` 没人写 → 自清 | `versions["branch:to:dispatch"] = 4` |
+
+**`branch:to:report` 被写了 3 次，但只推一个版本号** ——
+同一超步内所有变化通道共享同一个 `next_version`。
+
+#### Step 4 触发前 —— `report` 该醒了
+
+```text
+versions: {..., 'branch:to:report': 4, 'branch:to:research_one': 0}
+seen    : {..., 'research_one': {}, ...}
+avail   : {'branch:to:report': None}
+```
+
+`report` 被触发：它从没跑过（`seen.get("report")` 是 `None`），
+`branch:to:report` 可用 → ✓
+
+#### Step 4 —— `report` 跑，图结束
+
+```text
+step 4: ['report'] -> changed=['report']
+```
+
+`report` 写状态字段 `report`（数据通道），**不写任何分支通道**（出边是 END）。
+
+落盘：
+
+| 步 | 动作 | 结果 |
+| --- | --- | --- |
+| ① | `report` 记水位线 | `seen["report"] = {"branch:to:report": 4}` |
+| ④ | 写数据通道 `report` | `versions["report"] = 5` |
+| ⑤ | `branch:to:report` 没人写 → 自清 | `versions["branch:to:report"] = 5` |
+
+数据通道的版本也会推，但它**从不参与触发判定** —— 只有订阅它的节点才看版本，
+而 `report` 字段没有节点订阅它。
+
+所有分支通道都自清了，`avail` 为空 → 没有任务 → 图结束。
+
+### 5.4 一张表看完整条链
+
+| step | 跑的节点 | `versions` 变化 | `seen` 变化 |
+| --- | --- | --- | --- |
+| 开局 | — | `branch:to:split`: 0→1 | `seen["__start__"] = {"__start__": 0}` |
+| 1 | `split` | `branch:to:dispatch`: 0→2<br>`branch:to:split`: 1→2（自清） | `seen["split"] = {"branch:to:split": 1}` |
+| 2 | `dispatch` | `__pregel_tasks`: 0→3<br>`branch:to:dispatch`: 2→3（自清） | `seen["dispatch"] = {"branch:to:dispatch": 2}` |
+| 3 | `research_one`×3 | `branch:to:report`: 0→4<br>`branch:to:dispatch`: 3→4（自清） | `seen["research_one"] = {}` ← **空** |
+| 4 | `report` | `report`: 0→5<br>`branch:to:report`: 4→5（自清） | `seen["report"] = {"branch:to:report": 4}` |
+
+### 5.5 这条日志里三个最容易看错的点
+
+**① 版本新 ≠ 会触发。** step 2 里 `split` 的通道版本 2 > 水位线 1，
+但通道已被自清，所以不触发。可用性和版本是**与**的关系。
+
+**② `research_one` 的 `seen` 是空的 `{}`。** 不是 `None`，
+也不是 `{"branch:to:research_one": 0}`。PUSH 不推进水位线。
+这个 `{}` 意味着它走的是版本比较分支而不是"从没跑过"分支 ——
+对它没有实际影响（它是被 `__pregel_tasks` 唤醒的），
+但如果它同时还有一条静态入边，行为就会不一样。
+
+**③ `branch:to:research_one` 全程是 0。** Send 完全绕开分支通道。
+
+---
+
+## 6. 常见困惑速查
 
 ### Q: `versions` 和 `seen` 哪个先变？
 
@@ -639,7 +923,7 @@ versions_seen={k: dict(v) for k, v in rt.seen.items()},
 
 ---
 
-## 6. 调试
+## 7. 调试
 
 `config={"debug": True}` 会打印每一步的三张表（`runtime.py:195-210`）：
 
@@ -676,12 +960,15 @@ avail[chan]     = ?    ← 通道当前有没有值
 .venv/bin/python scripts/versions_seen_trace.py
 ```
 
-四个场景（线性链 / 回边 / 屏障 / Send 扇出）+ 三条不变式断言
-（`versions` 单调、`seen <= versions`、循环里水位线落后一格）。
+五个场景（线性链 / 回边 / 屏障 / Send 扇出 / Map-Reduce 扇出）
++ 三条不变式断言（`versions` 单调、`seen <= versions`、循环里水位线落后一格）。
+
+§5 的 Map-Reduce 完整日志来自 `examples/02_hitl_and_fanout.py` 的 B 段，
+场景 5 就是它的一个可独立运行的复刻。
 
 ---
 
-## 7. 一页速查表
+## 8. 一页速查表
 
 | 事件 | `versions` | `seen` |
 | --- | --- | --- |
@@ -698,7 +985,7 @@ avail[chan]     = ?    ← 通道当前有没有值
 
 ---
 
-## 8. 对照真实 LangGraph
+## 9. 对照真实 LangGraph
 
 | minigraph | LangGraph |
 | --- | --- |
