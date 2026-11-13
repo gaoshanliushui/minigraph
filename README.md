@@ -336,8 +336,10 @@ harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。
 
 | 文档 | 讲什么 |
 | --- | --- |
+| [`docs/LangGraph内核设计动机.md`](docs/LangGraph内核设计动机.md) | **为什么 LangGraph 要设计成"通道 + 版本 + 水位线"**：动机、权衡与代价（对照真实源码） |
 | [`docs/runtime超步循环详解.md`](docs/runtime超步循环详解.md) | `CompiledGraph._run` 的超步循环：算触发 → 并发跑 → 收写入 → 推版本 |
 | [`docs/channel通道模型详解.md`](docs/channel通道模型详解.md) | 各类通道的语义，重点是 `is_available()` 何时为真、通道活多久 |
+| [`docs/versions与seen水位线详解.md`](docs/versions与seen水位线详解.md) | `versions` / `seen` 两张表分别什么时候被谁改，含一条真实日志的逐行解读 |
 
 最后如果能一句话说清下面这个问题，就说明抓住了内核：
 
