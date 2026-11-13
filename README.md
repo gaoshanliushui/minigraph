@@ -272,7 +272,7 @@ tuple、bytes 都能原样还原），不用 pickle —— 反序列化不可信
 python tests/difflang/run.py
 ```
 
-当前包含 30 个单元/回归测试和 14 个差分场景。差分比较：
+当前包含 65 个单元/回归测试和 14 个差分场景。差分比较：
 每超步节点集合、超步总数、最终状态；失败场景还会直接插桩比较报错前的节点调用次数。
 注意真实 LangGraph 的 `stream_mode="updates"` 是**按任务**产出，不是按超步；
 harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。

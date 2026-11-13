@@ -194,12 +194,20 @@ class _RuntimeState:
 
     # -- 调试 -------------------------------------------------------------
     def dump(self, tag: str) -> None:
-        """把三张表打出来 —— 调试超步循环时最有用的一张图。"""
+        """
+        把三张表打出来 —— 调试超步循环时最有用的一张图。
+
+        只打**触发通道**（branch:to:* / join:* / __pregel_tasks）：
+        数据通道（状态字段）一旦被写就**始终可用**，而且从不参与触发判定，
+        混进来只会淹没真正要看的信息 —— 谁被唤醒了、水位线推到哪了。
+        """
+        trig = {c: ch for c, ch in self.channels.items() if c not in self.reducers}
         print(f"  {tag}")
-        print("    versions:", {k: v for k, v in sorted(self.versions.items())})
+        print("    versions:", {k: v for k, v in sorted(self.versions.items())
+                              if k not in self.reducers})
         print("    seen    :", {k: dict(sorted(v.items())) for k, v in sorted(self.seen.items())})
-        print("    avail   :", {c: (ch.get() if ch.is_available() else None)
-                               for c, ch in sorted(self.channels.items()) if ch.is_available()})
+        print("    avail   :", {c: trig[c].get() for c in sorted(trig)
+                               if trig[c].is_available()})
 
 
 class CompiledGraph:
