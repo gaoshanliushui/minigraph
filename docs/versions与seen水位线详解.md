@@ -23,7 +23,7 @@ seen:     dict[str, dict[str, int]]   # 节点 -> {通道: 该节点上次跑时
 | `versions` | **通道** | "这个通道被改动过几次？" | 通道自己变了的时候（写/消费/自清） |
 | `seen` | **节点** | "这个节点上次看到的是第几版？" | 节点跑完之后（推水位线） |
 
-**触发判定 = 两者比较**（`runtime.py:786`）：
+**触发判定 = 两者比较**（`runtime.py:873`）：
 
 ```python
 channels[chan].is_available()                     # 通道当前有值
@@ -38,7 +38,201 @@ and versions.get(chan, 0) > seen.get(chan, 0)     # 版本比这个节点的水�
 
 **关键**：两张表**独立前进**，谁也不等谁。这是理解全部困惑的钥匙。
 
+---
+
+## 0.5 为什么不能只看"通道可用性"
+
+> 这一节回答一个具体的质疑：**"只要判断通道可不可用，然后执行订阅了它的节点，
+> 不就够了吗？版本号是多余的吧？"**
+>
+> 结论先行：**在当前 minigraph 的实现里，这个质疑基本成立** ——
+> 实测下来两种判据在所有测试图上结果完全一致（§0.5.3）。
+> 但这不是因为版本号多余，而是因为**触发通道恰好都被设计成"每步一次性"**，
+> 让可用性退化成了版本差的一个投影。
+>
+> 下面把这个"恰好"拆开看：它在哪些地方成立、什么时候会失效、
+> 以及为什么 LangGraph 仍然保留版本号。
+
+### 0.5.1 先看这个质疑最强的场景
+
+回边 `agent -> tools -> agent`（§4.1 的例子）。每个节点只订阅**一条**触发通道：
+
+```text
+  step 3 触发前
+    versions: {..., 'branch:to:agent': 3, 'branch:to:tools': 3}
+    avail   : {'branch:to:agent': None}
+    nodes:
+      agent          [pull     ] branch:to:agent=1(v3 Δ+2) [可用]  -> 会被唤醒(PULL)
+      tools          [pull     ] branch:to:tools=2(v3 Δ+1) [不可用]  -> —
+```
+
+`agent` 的触发通道 `branch:to:agent` 可用 ⟹ 它在这一步被写过了 ⟹
+版本必然超过 `agent` 的水位线。**两个判据在这里塌缩成一个**，所以看起来版本号多余。
+
+这个直觉没错。问题是：它成立**只是因为** `branch:to:*` 是 `EphemeralValue`，
+而 `EphemeralValue` 每个超步没人写它就自清（`expire_unwritten`，`runtime.py:181-193`）。
+
+### 0.5.2 自清机制：让"可用"变成"这一步被写过"
+
+`EphemeralValue.update([])` 会把自己抹掉：
+
+```python
+if len(values) == 0:
+    # 空写入 = "本步没人写我" -> 自清
+    if self.value is not MISSING:
+        self.value = MISSING
+        return True
+    return False
+```
+
+于是分支通道"恰好活一个超步"。这带来一个连锁反应：
+
+```text
+本步没人写 branch:to:X  →  expire_unwritten 把它自清  →  下一步 is_available() = False
+本步有人写 branch:to:X  →  版本推到 next_version     →  versions[X] > seen[X] 成立
+```
+
+于是有了这个**等价关系**：
+
+> 对 `EphemeralValue` 触发通道，
+> **"可用" ⟺ "本步被写过" ⟺ "版本比水位线新"**（对所有跑过的节点而言）
+
+只要这个等价关系成立，"只看可用性"和"版本+水位线"就是**同一个判据的两种写法**。
+
+### 0.5.3 实测：两种判据在所有图上等价
+
+把 `_triggers` 换成"只看可用性"，跑一批图，逐步比对两个判据的结论：
+
+```bash
+.venv/bin/python scripts/exp_why.py
+```
+
+```text
+共检查 5 种图
+✓ 没有任何不一致 —— 两种判据在所有图上完全等价
+```
+
+跑完整测试套件也是全绿：
+
+```bash
+.venv/bin/python -m pytest tests/ -q -p scripts.exp_plugin_avail_only
+# 69 passed, 2 skipped
+```
+
+**这说明当前的测试套件根本没有覆盖版本判定。**
+版本号现在的作用，是"结构上保证"而不是"被测试锁定的行为" ——
+换句话说，它是**冗余但正确**的实现，不是可有可无的装饰。
+
+> ⚠️ 这一点值得单独说清楚：如果只看可用性就能跑通所有测试，
+> 那"版本号是必需的"这句话在**当前代码里是未经检验的**。
+> 真正把它钉死的是 LangGraph 的行为对齐和下面 §0.5.4 的几个失效场景。
+
+### 0.5.4 什么时候会失效：三个场景
+
+可用性模型在遇到"**通道可用，但这个节点不该再醒**"时会失效。
+下面三个场景都是**真实存在**的 —— 但要诚实说明的是：
+
+> **在当前实现里，这三个场景实测下来两种判据的结果都相同**（`scripts/exp_rearm.py`）。
+> 也就是说，它们现在还没有真的"崩"——
+> 失效的是**判据的表达能力**，不是当前代码的行为。
+>
+> 区别在于：可用性模型在这些场景里**碰巧**对，而版本号**保证**对。
+> 差别会在改动触发通道类型、或调整 `_advance` 里四步顺序时显现出来。
+
+#### ① 屏障重新武装 —— 同一通道的"第几次凑齐"
+
+`NamedBarrierValue` 触发后走 `consume()`：
+
+```python
+def consume(self) -> bool:
+    # 触发之后重新武装屏障，这样下一轮汇聚还能再等一次
+    if self.seen == self.names:
+        self.seen = set()
+        return True
+    return False
+```
+
+屏障**不清空自己**，只是把内部的 `seen` 集合清空重新武装。
+这意味着同一个 `join:a+b:c` 通道会被**反复使用** ——
+每一轮汇聚都是"这个通道可用"，可用性无法区分**第几次凑齐**。
+
+版本号能区分：`consume()` 会把屏障通道的版本推到 `next_version`（`runtime.py:176`），
+于是"这次凑齐"是一个**新的版本**，下一次汇聚自然越过水位线。
+
+> 当前实现里屏障场景两种判据结果相同 ——
+> 因为 `consume()` 和 `expire_unwritten` 的顺序恰好让屏障在下一轮重新凑齐前不可用。
+> 但这个"恰好"依赖 `_advance` 里的四步顺序，属于**隐式契约**，不是显式保证。
+
+#### ② `update_state` —— 人工推版本
+
+`update_state` 会调 `_apply_writes` 推版本，但**不动 `seen`**（`runtime.py:309`、`runtime.py:332`）。
+这是设计意图：人工改状态之后，"水位线过期"的节点才该醒。
+
+这里可用性帮不上什么忙 —— `update_state` 写的通道可用性变了，
+但**没有节点"跑过"**，所以没有水位线可以比。版本号是唯一能表达
+"这条消息是新的、之前没人看过"的东西。
+
+> 实测：`update_state(as_node="a")` 之后重跑，两种判据都让 `b` 再跑一次
+> （`branch:to:b` 被人工推了新版本，水位线过期）。
+> 结果一致，但可用性是**碰巧**对上了 —— 它并不知道"版本推进了"这件事，
+> 只是那个通道恰好可用而已。
+
+#### ③ 非一次性通道 —— 数据通道与 `accumulate=True` 的 Topic
+
+触发通道目前都被设计成一次性的，但这条性质**不是类型系统保证的**：
+
+- `Topic(accumulate=True)` 的 `update([])` **不会**清空已有值
+- 数据通道（状态字段）一旦被写就**永远可用**
+
+如果哪天有节点订阅了这类通道，"可用"就恒为真，节点会被**无限重复唤醒**。
+版本判定在这一刻提供的是**幂等性保证**：
+同一个版本只触发节点一次，除非通道真的又变了。
+
+> 这一条是**结构性**的，不是步序巧合 —— 数据通道本来就永远可用。
+> 现在的实现没出问题，只是因为**没有节点订阅数据通道**。
+
+### 0.5.5 小结：版本号真正买到了什么
+
+| 需求 | 可用性能否表达 | 版本号怎么解决 |
+| --- | --- | --- |
+| 场景 2 回边循环 | ✅ 能（自清让它等价） | 显式表达"落后一格" |
+| 场景 1 线性链 | ✅ 能 | — |
+| 屏障重新武装 | ⚠️ 靠步序巧合 | `consume()` 推新版本，区分第几次凑齐 |
+| `update_state` | ⚠️ 靠碰巧对上 | 人工推版本 = "水位线过期" |
+| 非一次性通道 | ❌ 不能（恒可用） | 同版本只触发一次（幂等） |
+
+（✅ = 当前实现下实测等价；⚠️ = 结果对但依赖巧合；❌ = 表达不了）
+
+一句话：
+
+> **版本号 = "这个信号是新消息，还是旧消息残留"。**
+>
+> 当前实现里，所有触发通道都恰好是一次性的（自清），
+> 于是可用性**碰巧**能顶替版本差。
+> 版本号买到的是**不依赖这个巧合的健壮性** ——
+> 换一种通道类型、换一个步序、加上 `update_state`，它都还成立。
+
+### 0.5.6 那为什么不把版本判定删掉？
+
+三个理由：
+
+1. **对齐 LangGraph。** 真实 LangGraph 的 `channel_versions` / `versions_seen`
+   是 checkpoint 的**必备字段**，缺了 checkpoint 就恢复不出调度状态。
+   minigraph 要做的是行为对齐，不只是"能跑就行"。
+
+2. **版本判定是更一般的形式。** "可用 ⟺ 新消息"只是**特定通道类型下**的推论。
+   把推论当实现，等于把类型约束藏进了运行时 —— 一旦通道类型变了，
+   隐藏的约束就会以 bug 的形式冒出来。
+
+3. **它让不变量可被断言。** `seen[node][chan] <= versions[chan]` 是一个
+   **可检查的性质**（§6 的不变式 2 就是它）。纯可用性模型里没有这个性质可查。
+
+> 这也和 §2.5 的"必须记写入前的版本"呼应：
+> 那条约束只有在有版本号时才需要操心。**有了版本号，调度才是可推理的。**
+
+
 > **怎么读这篇文档**：
+> §0.5 回答"**为什么不能只看通道可用性**"（带实测），
 > §1–§3 是规则（谁在什么时候改哪张表），
 > §4 是两个最小场景的完整时间线，
 > §5 是**一条真实日志的逐行解读**（Map-Reduce 扇出）—— 第一次读可以直接跳到 §5。
@@ -58,7 +252,7 @@ def _next_version(versions: dict[str, int]) -> int:
     return max(versions.values(), default=0) + 1
 ```
 
-（`runtime.py:841`）
+（`runtime.py:928`）
 
 含义：版本号**只在通道状态真的变了时**前进；一次超步里所有变化的通道**共享同一个**新版本号。
 
@@ -68,9 +262,9 @@ def _next_version(versions: dict[str, int]) -> int:
 
 | # | 位置 | 时机 | 改什么 |
 | --- | --- | --- | --- |
-| ① | `runtime.py:464` / `405-406` | 运行初始化 / 恢复 | 全置 `0`，恢复时用 checkpoint 覆盖 |
-| ② | `runtime.py:490` | 开局 `__start__` 写入口信号 | 所有入口通道 = 同一个 `start_version` |
-| ③ | `runtime.py:879` | `_apply_writes`：本步的写入落地 | 被写且**状态真变了**的通道 = `next_version` |
+| ① | `runtime.py:490` / `405-406` | 运行初始化 / 恢复 | 全置 `0`，恢复时用 checkpoint 覆盖 |
+| ② | `runtime.py:549` | 开局 `__start__` 写入口信号 | 所有入口通道 = 同一个 `start_version` |
+| ③ | `runtime.py:966` | `_apply_writes`：本步的写入落地 | 被写且**状态真变了**的通道 = `next_version` |
 | ④ | `runtime.py:176` | `consume_triggers`：屏障被消费 | 屏障通道 = `next_version` |
 | ⑤ | `runtime.py:191` | `expire_unwritten`：没人写的通道自清 | 被清空的通道 = `next_version` |
 
@@ -78,13 +272,13 @@ def _next_version(versions: dict[str, int]) -> int:
 
 #### ① 初始化 / 恢复
 
-全新运行（`runtime.py:464`）：
+全新运行（`runtime.py:490`）：
 
 ```python
 versions = {c: 0 for c in channels}
 ```
 
-从 checkpoint 恢复（`runtime.py:405-406`）：
+从 checkpoint 恢复（`runtime.py:474-406`）：
 
 ```python
 versions = {c: 0 for c in channels}
@@ -93,7 +287,7 @@ versions.update(snap.channel_versions or {})
 
 即：**先全填 0，再用 checkpoint 里的值覆盖**。checkpoint 里没有的通道（运行中才出现的）保持 0。
 
-#### ② 开局：`__start__` 写入口信号（`runtime.py:485-492`）
+#### ② 开局：`__start__` 写入口信号（`runtime.py:570-492`）
 
 ```python
 start_spec = self.nodes.get(START)
@@ -110,7 +304,7 @@ if start_spec:
 > 注意这里的 `update([None])`：分支通道 `EphemeralValue` 存的值是 `None`，
 > 它的意义不是"值是什么"，而是"我被写过了"。
 
-#### ③ 应用写入：`_apply_writes`（`runtime.py:846-882`）
+#### ③ 应用写入：`_apply_writes`（`runtime.py:933-882`）
 
 ```python
 version = _next_version(versions) if next_version is None else next_version
@@ -167,13 +361,19 @@ def consume(self) -> bool:
 ```text
   step 1 触发前
     versions: {..., 'branch:to:a': 1, 'branch:to:b': 1, 'branch:to:c': 0, 'join:a+b:c': 0}
-    seen    : {'__start__': {'__start__': 0}}
     avail   : {'branch:to:a': None, 'branch:to:b': None}
+    nodes:
+      a              [no-watermark] branch:to:a=-1 [可用]  -> 会被唤醒(PULL)
+      b              [no-watermark] branch:to:b=-1 [可用]  -> 会被唤醒(PULL)
+      c              [no-watermark] branch:to:c=-0 [不可用]  join:a+b:c=-0 [不可用]  -> —
   step 1: ['a', 'b'] -> changed=['x', 'join:a+b:c', 'x', 'join:a+b:c']
   step 2 触发前
     versions: {..., 'branch:to:a': 2, 'branch:to:b': 2, 'branch:to:c': 0, 'join:a+b:c': 2}
-    seen    : {..., 'a': {'branch:to:a': 1}, 'b': {'branch:to:b': 1}}
     avail   : {'join:a+b:c': None}
+    nodes:
+      a              [pull     ] branch:to:a=1(v2 Δ+1) [不可用]  -> —
+      b              [pull     ] branch:to:b=1(v2 Δ+1) [不可用]  -> —
+      c              [no-watermark] branch:to:c=-0 [不可用]  join:a+b:c=-2 [可用]  -> 会被唤醒(PULL)
   step 2: ['c'] -> changed=['x']
 ```
 
@@ -241,7 +441,7 @@ seen = {
 | `seen[name] == {}` | 跑过，但是**通过 Send（PUSH）** 进来的 | 走正常版本比较（`seen.get(chan,0)` 默认 0，所以任何正版本都触发） |
 | `seen[name] == {chan: v}` | 正常跑过，已有水位线 | `versions[chan] > v` 才触发 |
 
-对应 `_triggers`（`runtime.py:765-788`）：
+对应 `_triggers`（`runtime.py:852-788`）：
 
 ```python
 def _triggers(channels, versions, seen, trig) -> bool:
@@ -267,17 +467,17 @@ def _triggers(channels, versions, seen, trig) -> bool:
 
 | # | 位置 | 时机 | 改什么 |
 | --- | --- | --- | --- |
-| ① | `runtime.py:477` / `408` | 运行初始化 / 恢复 | 全新 = `{}`；恢复 = checkpoint 里的 `versions_seen` |
-| ② | `runtime.py:492` | 开局 `__start__` | `seen[START] = {"__start__": 该通道版本}` |
+| ① | `runtime.py:562` / `408` | 运行初始化 / 恢复 | 全新 = `{}`；恢复 = checkpoint 里的 `versions_seen` |
+| ② | `runtime.py:577` | 开局 `__start__` | `seen[START] = {"__start__": 该通道版本}` |
 | ③ | `runtime.py:135-157` | **`advance_watermarks`：本步跑完的节点** | 把它看过的触发通道版本记进去 |
 
-**全代码里 `advance_watermarks` 只有一个调用点**（`runtime.py:640`，在 `_advance` 里）——
+**全代码里 `advance_watermarks` 只有一个调用点**（`runtime.py:727`，在 `_advance` 里）——
 也就是说，**只有"节点真的跑了"才会推进水位线**，别无其它来源。
 
 `update_state` **不会**推进任何水位线：人工改状态时没有节点"跑过"，
 `seen` 原封不动地从 checkpoint 恢复（`runtime.py:309`）。
 
-### 2.4 ② 开局：`__start__` 给自己记水位线（`runtime.py:492`）
+### 2.4 ② 开局：`__start__` 给自己记水位线（`runtime.py:577`）
 
 ```python
 rt.seen[START] = {start_spec.triggers[0]: rt.versions[start_spec.triggers[0]]}
@@ -322,7 +522,7 @@ def advance_watermarks(self, tasks: list[Task]) -> None:
 
 #### 为什么必须是"写入前"
 
-这是最容易踩坑的地方。`_advance`（`runtime.py:628-647`）的顺序是：
+这是最容易踩坑的地方。`_advance`（`runtime.py:671-647`）的顺序是：
 
 ```python
 rt.advance_watermarks(tasks)          # 1. 先记水位线（此时版本还是旧值）
@@ -358,7 +558,7 @@ step 3 就变成 `versions["branch:to:agent"]`（3）`>` `seen`（2）—— 表
 那时 `versions == seen`，`>` 不成立，循环立刻停转。
 **这就是那条注释在说的事。**
 
-### 2.6 `update_state` 路径（`runtime.py:339-344`）
+### 2.6 `update_state` 路径（`runtime.py:424-344`）
 
 ```python
 rt = _RuntimeState(
@@ -408,11 +608,15 @@ if hits:
 ```text
   step 1 触发前
     versions: {..., 'branch:to:a': 1, 'branch:to:b': 0}
-    seen    : {'__start__': {'__start__': 0}}
+    nodes:
+      a              [no-watermark] branch:to:a=-1 [可用]  -> 会被唤醒(PULL)
+      b              [no-watermark] branch:to:b=-0 [不可用]  -> —
   step 1: ['a'] -> changed=['x', 'branch:to:b']
   step 2 触发前
     versions: {..., 'branch:to:a': 2, 'branch:to:b': 2}
-    seen    : {..., 'a': {'branch:to:a': 1}}
+    nodes:
+      a              [pull     ] branch:to:a=1(v2 Δ+1) [不可用]  -> —
+      b              [no-watermark] branch:to:b=-2 [可用]  -> 会被唤醒(PULL)
   step 2: b 挂起
 --- checkpoint after interrupt ---
 channel_versions: {'x': 2, 'branch:to:a': 2, 'branch:to:b': 2, '__start__': 0, '__pregel_tasks': 0}
@@ -484,18 +688,24 @@ step: 2
 > ```text
 >   step 1 触发前
 >     versions: {'__pregel_tasks': 0, '__start__': 0, 'branch:to:a': 1, 'branch:to:b': 0}
->     seen    : {'__start__': {'__start__': 0}}
 >     avail   : {'branch:to:a': None}
+>     nodes:
+>       a              [no-watermark] branch:to:a=-1 [可用]  -> 会被唤醒(PULL)
+>       b              [no-watermark] branch:to:b=-0 [不可用]  -> —
 >   step 1: ['a'] -> changed=['x', 'branch:to:b']
 >   step 2 触发前
 >     versions: {'__pregel_tasks': 0, '__start__': 0, 'branch:to:a': 2, 'branch:to:b': 2}
->     seen    : {'__start__': {'__start__': 0}, 'a': {'branch:to:a': 1}}
 >     avail   : {'branch:to:b': None}
+>     nodes:
+>       a              [pull     ] branch:to:a=1(v2 Δ+1) [不可用]  -> —
+>       b              [no-watermark] branch:to:b=-2 [可用]  -> 会被唤醒(PULL)
 >   step 2: ['b'] -> changed=['x']
 > ```
 >
 > 注意 step 2 的 `branch:to:a` 版本已经是 **2**（自清时推的），
 > 但它已被清空所以 `avail` 里没有它 —— 版本推了，值没了，于是不再触发。
+> 逐节点那行把这件事说得很直白：`a` 的 `Δ+1` 说明版本是新的，
+> 但 `[不可用]` 说明通道已经空了，`-> —` 就是没醒。
 
 注意 step 2 里 `a` 的判定：版本确实比水位线新（2 > 1），但**通道不可用**，
 所以没触发。**两个条件是"与"的关系，缺一不可** —— 这是最容易被忽略的一点。
@@ -507,26 +717,35 @@ step: 2
 ```text
   step 1 触发前
     versions: {..., 'branch:to:agent': 1, 'branch:to:tools': 0}
-    seen    : {'__start__': {'__start__': 0}}
+    nodes:
+      agent          [no-watermark] branch:to:agent=-1 [可用]  -> 会被唤醒(PULL)
+      tools          [no-watermark] branch:to:tools=-0 [不可用]  -> —
   step 1: ['agent'] -> changed=['x', 'branch:to:tools']
   step 2 触发前
     versions: {..., 'branch:to:agent': 2, 'branch:to:tools': 2}
-    seen    : {..., 'agent': {'branch:to:agent': 1}}
+    nodes:
+      agent          [pull     ] branch:to:agent=1(v2 Δ+1) [不可用]  -> —
+      tools          [no-watermark] branch:to:tools=-2 [可用]  -> 会被唤醒(PULL)
   step 2: ['tools'] -> changed=['x', 'branch:to:agent']
   step 3 触发前
     versions: {..., 'branch:to:agent': 3, 'branch:to:tools': 3}
-    seen    : {..., 'agent': {'branch:to:agent': 1}, 'tools': {'branch:to:tools': 2}}
     avail   : {'branch:to:agent': None}
+    nodes:
+      agent          [pull     ] branch:to:agent=1(v3 Δ+2) [可用]  -> 会被唤醒(PULL)
+      tools          [pull     ] branch:to:tools=2(v3 Δ+1) [不可用]  -> —
   step 3: ['agent'] -> ...
 ```
 
 step 3 是关键：`versions["branch:to:agent"] = 3`，
 但 `seen["agent"]["branch:to:agent"]` 还停在 **1**（step 1 记的写入前版本），
-`3 > 1` → agent 再次被唤醒。
+`3 > 1` → agent 再次被唤醒。逐节点那行写作 `branch:to:agent=1(v3 Δ+2)`。
 
 **agent 的水位线总是比通道版本落后一个超步** —— 这个"落后一格"就是循环的燃料。
 如果 `advance_watermarks` 记的是写入后的版本（3），水位线会追平版本，
 `3 > 3` 不成立，循环立刻停转。
+
+> 顺带一说：这一行的 `Δ+2` 说明**"只看可用性"在这里和版本判定等价** ——
+> 通道可用 ⟺ 本步被写过 ⟺ 版本比水位线新。为什么会等价，见 §0.5。
 
 ---
 
@@ -580,25 +799,45 @@ def reduce_report(state):
 ```text
 step 1 触发前
   versions: {'__pregel_tasks': 0, '__start__': 0, 'branch:to:dispatch': 0, 'branch:to:report': 0, 'branch:to:research_one': 0, 'branch:to:split': 1}
-  seen    : {'__start__': {'__start__': 0}}
   avail   : {'branch:to:split': None}
+  nodes:
+    dispatch       [no-watermark] branch:to:dispatch=-0 [不可用]  -> —
+    report         [no-watermark] branch:to:report=-0 [不可用]  -> —
+    research_one   [no-watermark] branch:to:research_one=-0 [不可用]  -> —
+    split          [no-watermark] branch:to:split=-1 [可用]  -> 会被唤醒(PULL)
 step 1: ['split'] -> changed=['subtasks', 'branch:to:dispatch']
 step 2 触发前
   versions: {'__pregel_tasks': 0, '__start__': 0, 'branch:to:dispatch': 2, 'branch:to:report': 0, 'branch:to:research_one': 0, 'branch:to:split': 2}
-  seen    : {'__start__': {'__start__': 0}, 'split': {'branch:to:split': 1}}
   avail   : {'branch:to:dispatch': None}
+  nodes:
+    dispatch       [no-watermark] branch:to:dispatch=-2 [可用]  -> 会被唤醒(PULL)
+    report         [no-watermark] branch:to:report=-0 [不可用]  -> —
+    research_one   [no-watermark] branch:to:research_one=-0 [不可用]  -> —
+    split          [pull     ] branch:to:split=1(v2 Δ+1) [不可用]  -> —
 step 2: ['dispatch'] -> changed=['__pregel_tasks', '__pregel_tasks', '__pregel_tasks']
 step 3 触发前
   versions: {'__pregel_tasks': 3, '__start__': 0, 'branch:to:dispatch': 3, 'branch:to:report': 0, 'branch:to:research_one': 0, 'branch:to:split': 2}
-  seen    : {'__start__': {'__start__': 0}, 'dispatch': {'branch:to:dispatch': 2}, 'split': {'branch:to:split': 1}}
   avail   : {'__pregel_tasks': [Send(node='research_one', arg={'question': '固态电池产业', 'aspect': '市场规模'}), Send(node='research_one', arg={'question': '固态电池产业', 'aspect': '竞争格局'}), Send(node='research_one', arg={'question': '固态电池产业', 'aspect': '监管风险'})]}
+  nodes:
+    dispatch       [pull     ] branch:to:dispatch=2(v3 Δ+1) [不可用]  -> —
+    report         [no-watermark] branch:to:report=-0 [不可用]  -> —
+    research_one   [no-watermark] branch:to:research_one=-0 [不可用]  -> 会被唤醒(PUSH×3)
+    split          [pull     ] branch:to:split=1(v2 Δ+1) [不可用]  -> —
 step 3: ['research_one', 'research_one', 'research_one'] -> changed=['findings', 'branch:to:report', 'findings', 'branch:to:report', 'findings', 'branch:to:report']
 step 4 触发前
   versions: {'__pregel_tasks': 4, '__start__': 0, 'branch:to:dispatch': 3, 'branch:to:report': 4, 'branch:to:research_one': 0, 'branch:to:split': 2}
-  seen    : {'__start__': {'__start__': 0}, 'dispatch': {'branch:to:dispatch': 2}, 'research_one': {}, 'split': {'branch:to:split': 1}}
   avail   : {'branch:to:report': None}
+  nodes:
+    dispatch       [pull     ] branch:to:dispatch=2(v3 Δ+1) [不可用]  -> —
+    report         [no-watermark] branch:to:report=-4 [可用]  -> 会被唤醒(PULL)
+    research_one   [push-only] branch:to:research_one=0(v0 Δ+0) [不可用]  -> —
+    split          [pull     ] branch:to:split=1(v2 Δ+1) [不可用]  -> —
 step 4: ['report'] -> changed=['report']
 ```
+
+> `dump` 现在是**每节点一行**的形态（见 §7）。上面这份日志里，
+> `research_one` 在 step 3 标着 `会被唤醒(PUSH×3)` —— 它是被 Send 队列唤醒的，
+> **不是**被版本差唤醒的；`branch:to:research_one` 的版本全程是 0。
 
 ### 5.3 逐超步拆解
 
@@ -606,8 +845,9 @@ step 4: ['report'] -> changed=['report']
 
 ```text
 versions: {..., 'branch:to:split': 1, 'branch:to:dispatch': 0, ...}
-seen    : {'__start__': {'__start__': 0}}
 avail   : {'branch:to:split': None}
+nodes:
+  split          [no-watermark] branch:to:split=-1 [可用]  -> 会被唤醒(PULL)
 ```
 
 开局状态（`_begin`，`runtime.py:463-493`）：
@@ -621,6 +861,7 @@ avail   : {'branch:to:split': None}
   但**被写过就算"可用"** —— 值是什么不重要，重要的是"被写过"。
 
 **算触发**：`split` 的 `seen.get("split")` 是 `None` → 从没跑过 → 通道可用 → ✓ 触发。
+（`no-watermark` 就是这个状态：没有水位线，只看可用性。）
 
 #### Step 1 —— `split` 跑
 
@@ -644,8 +885,10 @@ step 1: ['split'] -> changed=['subtasks', 'branch:to:dispatch']
 
 ```text
 versions: {..., 'branch:to:dispatch': 2, 'branch:to:split': 2}
-seen    : {..., 'split': {'branch:to:split': 1}}
 avail   : {'branch:to:dispatch': None}
+nodes:
+  dispatch       [no-watermark] branch:to:dispatch=-2 [可用]  -> 会被唤醒(PULL)
+  split          [pull     ] branch:to:split=1(v2 Δ+1) [不可用]  -> —
 ```
 
 **两个关键点：**
@@ -655,6 +898,8 @@ avail   : {'branch:to:dispatch': None}
 - 但通道**已被自清**，`is_available()` 为 False ✗
 
 **两个条件是"与"的关系，缺一不可** —— 版本推进了不代表会触发。
+这一行 `split ... [不可用] -> —` 把两件事都摊开了：`Δ+1` 说明版本是新的，
+`[不可用]` 说明通道已经空了，所以没触发。
 
 **② `branch:to:split` 的版本是 2 而不是 1。** 尽管它从 step 2 起再没被写过，
 但自清也算一次变化，照样推版本。这样任何节点的水位线都追不上一个已被清空的通道。
@@ -691,7 +936,7 @@ avail   : {'__pregel_tasks': [Send(...), Send(...), Send(...)]}
 
 `avail` 里 `__pregel_tasks` 的值是三个 Send 包 —— 这是 `Topic` 通道，存的是列表。
 
-**触发是怎么发生的**（`_prepare_next_tasks`，`runtime.py:808-816`）：
+**触发是怎么发生的**（`_prepare_next_tasks`，`runtime.py:878-816`）：
 
 ```python
 tc = channels.get(TASKS)
@@ -715,7 +960,7 @@ step 3: ['research_one', 'research_one', 'research_one']
   -> changed=['findings', 'branch:to:report', 'findings', 'branch:to:report', 'findings', 'branch:to:report']
 ```
 
-三个 `research_one` 在同一超步内**并发**执行（`ThreadPoolExecutor`，`runtime.py:972`），
+三个 `research_one` 在同一超步内**并发**执行（`ThreadPoolExecutor`，`runtime.py:1059`），
 每个都写 `findings` 和 `branch:to:report`。
 
 并发写不冲突，因为：
@@ -755,12 +1000,17 @@ Send 的触发源是保留通道 `__pregel_tasks`，不是目标节点的 `branc
 
 ```text
 versions: {..., 'branch:to:report': 4, 'branch:to:research_one': 0}
-seen    : {..., 'research_one': {}, ...}
 avail   : {'branch:to:report': None}
+nodes:
+  report         [no-watermark] branch:to:report=-4 [可用]  -> 会被唤醒(PULL)
+  research_one   [push-only] branch:to:research_one=0(v0 Δ+0) [不可用]  -> —
 ```
 
 `report` 被触发：它从没跑过（`seen.get("report")` 是 `None`），
 `branch:to:report` 可用 → ✓
+
+（`research_one` 那行是 `push-only` —— 它跑过，但水位线是空的，
+因为 PUSH 不推进水位线。见 §2.2。）
 
 #### Step 4 —— `report` 跑，图结束
 
@@ -847,6 +1097,17 @@ expire_unwritten (改 versions)
 
 会。`seen.get(name) is None` 时只看**可用性**，不看版本 —— 入口节点就是靠这个被点亮的。
 
+### Q: 只判断通道可用性不就够了吗？版本号是不是多余？
+
+在**当前实现**里两种判据结果完全一致（实测见 §0.5.3），所以你的直觉不算错。
+但这依赖于"触发通道都是一次性的"这个**巧合**：
+`EphemeralValue` 每步自清，于是"可用"⟺"本步被写过"⟺"版本比水位线新"。
+
+版本号买到的是**不依赖这个巧合的健壮性** ——
+屏障重新武装、`update_state`、非一次性通道这三种场景里，
+可用性表达不了"这是新消息还是旧消息残留"，版本号可以。
+详细拆解见 §0.5。
+
 ### Q: Send 进来的节点，`seen` 长什么样？
 
 `{"node": {}}` —— 空字典，**不是 None**。所以它走的是版本比较分支而不是"从没跑过"分支。
@@ -857,13 +1118,17 @@ expire_unwritten (改 versions)
 ```text
   step 2 触发前
     versions: {..., '__pregel_tasks': 2, 'branch:to:fan': 2, 'branch:to:worker': 0}
-    seen    : {'__start__': {...}, 'fan': {'branch:to:fan': 1}}
     avail   : {'__pregel_tasks': [Send(node='worker', arg={'x': 'w1'}), Send(node='worker', arg={'x': 'w2'})]}
+    nodes:
+      fan            [pull     ] branch:to:fan=1(v2 Δ+1) [不可用]  -> —
+      worker         [no-watermark] branch:to:worker=-0 [不可用]  -> 会被唤醒(PUSH×2)
   step 2: ['worker', 'worker'] -> changed=['x', 'branch:to:fan', 'x', 'branch:to:fan']
   step 3 触发前
     versions: {..., '__pregel_tasks': 3, 'branch:to:fan': 3, 'branch:to:worker': 0}
-    seen    : {'__start__': {...}, 'fan': {'branch:to:fan': 1}, 'worker': {}}
     avail   : {'branch:to:fan': None}
+    nodes:
+      fan            [pull     ] branch:to:fan=1(v2 Δ+1) [不可用]  -> —
+      worker         [push-only] branch:to:worker=0(v0 Δ+0) [不可用]  -> —
 ```
 
 三个观察：
@@ -915,42 +1180,53 @@ channel_versions=dict(rt.versions),
 versions_seen={k: dict(v) for k, v in rt.seen.items()},
 ```
 
-恢复时由 `_restore_channels`（`runtime.py:405-408`）原样读回。
+恢复时由 `_restore_channels`（`runtime.py:474-408`）原样读回。
 
 ### Q: `update_state` 之后这两张表怎么变？
 
-- `versions`：走 `_apply_writes`（`runtime.py:332`），被写的通道推版本；随后 `expire_unwritten`（`runtime.py:344`）清掉没写的触发通道并推版本。
+- `versions`：走 `_apply_writes`（`runtime.py:332`），被写的通道推版本；随后 `expire_unwritten`（`runtime.py:429`）清掉没写的触发通道并推版本。
 - `seen`：**不动**（从 checkpoint 原样恢复，`runtime.py:309`）。
 
 ---
 
 ## 7. 调试
 
-`config={"debug": True}` 会打印每一步的三张表（`runtime.py:195-210`）：
+`config={"debug": True}` 会打印每一步的触发判定快照（`runtime.py:196-224`）。
+输出是**每节点一行**的 —— 判定条件的两端（版本、水位线）直接并排摆出来，
+差值 `Δ` 已经算好：
 
-```python
-def dump(self, tag: str) -> None:
-    trig = {c: ch for c, ch in self.channels.items() if c not in self.reducers}
-    print(f"  {tag}")
-    print("    versions:", {k: v for k, v in sorted(self.versions.items())
-                          if k not in self.reducers})
-    print("    seen    :", {k: dict(sorted(v.items())) for k, v in sorted(self.seen.items())})
-    print("    avail   : {c: trig[c].get() for c in sorted(trig)
-                           if trig[c].is_available()})
+```text
+  step 3 触发前
+    versions: {'__pregel_tasks': 0, '__start__': 0, 'branch:to:agent': 3, 'branch:to:tools': 3}
+    avail   : {'branch:to:agent': None}
+    nodes:
+      agent          [pull     ] branch:to:agent=1(v3 Δ+2) [可用]  -> 会被唤醒(PULL)
+      tools          [pull     ] branch:to:tools=2(v3 Δ+1) [不可用]  -> —
 ```
+
+怎么读：
+
+```text
+branch:to:agent=1(v3 Δ+2)
+              ↑  ↑   ↑
+              │  │   └ 版本比水位线领先多少 —— >0 才可能触发
+              │  └───── 通道当前版本
+              └──────── 这个节点上次确认的版本（水位线）
+
+[可用] / [不可用]  ← 通道当前有没有值
+-> 会被唤醒(PULL) / 会被唤醒(PUSH×N) / —
+```
+
+方括号里的水位线状态：
+
+| 状态 | 含义 |
+| --- | --- |
+| `pull` | 有水位线，按版本差判定 |
+| `push-only` | 跑过但水位线为空 —— PUSH（Send）来的，绕开分支通道 |
+| `no-watermark` | 没有水位线 —— 只要通道可用就触发，不看版本 |
 
 只打**触发通道**（`branch:to:*` / `join:*` / `__pregel_tasks`）——
 数据通道一旦被写就始终可用，从不参与触发判定，混进来只会淹没真正要看的信息。
-
-看的时候对着这张表读：
-
-```text
-versions[chan]  = V     ← 通道现在第几版
-seen[node][chan] = S   ← 这个节点上次看到第几版
-avail[chan]     = ?    ← 通道当前有没有值
-
-触发 = avail[chan] AND V > S
-```
 
 > ⚠️ `dump` 打印的是**该超步执行前**的快照。所以某个节点跑完后的水位线，
 > 要在**下一个超步**的 dump 里才看得到。
@@ -966,6 +1242,22 @@ avail[chan]     = ?    ← 通道当前有没有值
 
 §5 的 Map-Reduce 完整日志来自 `examples/02_hitl_and_fanout.py` 的 B 段，
 场景 5 就是它的一个可独立运行的复刻。
+
+§0.5 的实验脚本（都不改项目源码，只在运行时 monkeypatch `runtime._triggers`）：
+
+```bash
+# 逐节点比对两个判据的结论（§0.5.3）
+.venv/bin/python scripts/exp_why.py
+
+# 整包测试：换成"只看可用性"后测试还能不能过
+.venv/bin/python -m pytest tests/ -q -p scripts.exp_plugin_avail_only
+
+# 各种图上两种判据的行为对比
+.venv/bin/python scripts/exp_compare_triggers.py
+
+# 屏障重新武装 / update_state 两种判据的对照
+.venv/bin/python scripts/exp_rearm.py
+```
 
 ---
 
