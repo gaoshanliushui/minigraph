@@ -194,5 +194,5 @@ def print_graph(app):
         print()
 
 if __name__ == "__main__":
-    # demo_hitl()
+    demo_hitl()
     demo_fanout()
