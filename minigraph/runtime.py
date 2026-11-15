@@ -507,12 +507,27 @@ class CompiledGraph:
         resume_val = cfg.get("resume")
         debug = cfg.get("debug", False)
 
-        if input is None and snap is not None:
-            # ---------- 从 checkpoint 恢复 ----------
+        if snap is not None:
+            # ---------- 从 checkpoint 恢复（可能还带新输入）----------
             channels, versions, seen = self._restore_channels(snap)
             extra_values = {
                 k: v for k, v in snap.values.items() if k not in reducers
             }
+            # 输入是**追加**到已有状态上，不是替换 —— 对齐真实 LangGraph：
+            # 它也是先 channels_from_checkpoint() 恢复，再把 input 当作
+            # INPUT 写入落进这些通道（langgraph/pregel/main.py:1793 起）。
+            # 所以同一 thread 反复 invoke，messages 会一条条累积。
+            if input is not None:
+                raw = dict(input)
+                _write_state_channels(
+                    reducers, channels,
+                    {k: v for k, v in raw.items() if k in reducers},
+                    node=START,
+                    types=self.field_types,
+                )
+                extra_values.update(
+                    {k: v for k, v in raw.items() if k not in reducers}
+                )
             rt = _RuntimeState(
                 nodes=self.nodes, reducers=reducers,
                 channels=channels, versions=versions, seen=seen,
@@ -540,6 +555,26 @@ class CompiledGraph:
                 _ctx()["resume"] = {}
                 if debug:
                     print(f"[resume] step={rt.step} versions={versions}")
+
+            # 带新输入 = 开新一轮对话。__start__ 要再写一次入口通道，
+            # 版本号必须比存档里的新 —— 否则入口节点的水位线已经追上了，
+            # 触发判定会认为"没有新东西"，这一轮就不会跑。
+            # 纯恢复（input is None）不重复点亮：那是接着上次继续。
+            if input is not None:
+                start_spec = self.nodes.get(START)
+                if start_spec:
+                    start_version = rt.next_version()
+                    for chan in start_spec.writers:
+                        rt.channels[chan].update([None])
+                        rt.versions[chan] = start_version
+                        # 恢复时 updated 是 None（= 下一轮全量扫描所有节点）。
+                        # 这里要往里加通道，得先把它变成一个真正的集合。
+                        if rt.updated is None:
+                            rt.updated = set()
+                        rt.updated.add(chan)
+                    rt.seen[START] = {
+                        start_spec.triggers[0]: rt.versions[start_spec.triggers[0]]
+                    }
             return rt
 
         # ---------- 全新运行 ----------

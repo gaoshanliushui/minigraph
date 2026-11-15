@@ -48,6 +48,19 @@ def build_send_graph():
     return g
 
 
+def build_simple_graph():
+    """没有 interrupt 的线性图 —— 用来测"同一 thread 多次调用"的语义。
+
+    build_graph() 中间有个 interrupt()，跑到那儿就冻住了；测"追加语义"
+    时不想被 HITL 那条线干扰，所以单独建一个干净的图。
+    """
+    g = StateGraph(S)
+    g.add_node("echo", lambda s: {"log": [f"echo:{s['draft']}"], "draft": "done"})
+    g.add_edge(START, "echo")
+    g.add_edge("echo", END)
+    return g
+
+
 @pytest.fixture(params=["memory", "sqlite"])
 def saver(request, tmp_path):
     """同一套断言对两种 saver 各跑一遍。"""
@@ -192,6 +205,72 @@ def test_send_fanout_survives_restart(tmp_path):
     # Send 对象必须原样读回来（否则恢复后并行分支会重建不出来）
     assert any(isinstance(t, Send) for c in hist for t in c.tasks)
     saver2.close()
+
+
+# ------------------------------------------------- 同一 thread 多次调用
+def test_new_input_on_an_existing_thread_is_appended(saver):
+    """给已存在的 thread 传输入 = **追加**，不是替换。
+
+    对齐真实 LangGraph：它也是先 channels_from_checkpoint() 恢复，
+    再把 input 当作 INPUT 写进那些通道（langgraph/pregel/main.py:1793 起）。
+    """
+    app = build_simple_graph().compile(checkpointer=saver)
+    cfg = {"thread_id": "conv"}
+
+    out1 = app.invoke({"log": ["q1"], "draft": ""}, cfg)
+    out2 = app.invoke({"log": ["q2"], "draft": ""}, cfg)
+
+    # 两轮都留下了，而不是第二轮把第一轮顶掉
+    assert out1["log"] == ["q1", "echo:"]
+    assert out2["log"][:3] == ["q1", "echo:", "q2"]
+    # 第二轮确实又跑了一遍节点
+    assert out2["log"].count("echo:") == 2
+
+
+def test_input_on_existing_thread_reruns_the_graph(saver):
+    """追加输入之后，图要**再跑一遍** —— 不能因为水位线追上了就跳过。"""
+    app = build_simple_graph().compile(checkpointer=saver)
+    cfg = {"thread_id": "conv"}
+
+    app.invoke({"log": [], "draft": ""}, cfg)
+    first = app.get_state(cfg)
+
+    app.invoke({"log": [], "draft": ""}, cfg)
+    second = app.get_state(cfg)
+
+    # 第二轮确实又跑了（超步数往前走了），不是原地不动
+    assert second.step > first.step
+    assert second.values["log"].count("echo:") == 2
+
+
+def test_resume_without_input_does_not_rerun_the_entry(saver):
+    """纯恢复（input=None）不该重复点亮入口通道。
+
+    带输入 = 开新一轮对话；不带输入 = 接着上次继续。
+    """
+    app = build_graph().compile(checkpointer=saver)
+    cfg = {"thread_id": "conv"}
+
+    app.invoke({"log": [], "draft": ""}, cfg)
+    before = app.get_state(cfg)
+
+    app.invoke(None, {**cfg, "resume": "批准"})
+    after = app.get_state(cfg)
+
+    # 恢复后跑完了剩下的流程，但没有从头再来一遍
+    assert after.values["log"].count("write") == 1
+    assert after.step > before.step
+
+
+def test_fresh_thread_starts_from_scratch(saver):
+    """换个 thread_id 就是全新的对话 —— 不受别的 thread 影响。"""
+    app = build_simple_graph().compile(checkpointer=saver)
+
+    app.invoke({"log": ["q1"], "draft": ""}, {"thread_id": "a"})
+    out = app.invoke({"log": ["q2"], "draft": ""}, {"thread_id": "b"})
+
+    assert out["log"][:1] == ["q2"]
+    assert "q1" not in out["log"]
 
 
 def test_delete_thread():

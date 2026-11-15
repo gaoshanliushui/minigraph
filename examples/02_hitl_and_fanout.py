@@ -12,6 +12,7 @@ B. Map-Reduce 扇出：Send 把 N 个子任务并行派发，reducer 自动汇�
 import operator
 from pathlib import Path
 import time
+import uuid
 from typing import Annotated
 
 from minigraph.builder import StateGraph
@@ -26,6 +27,12 @@ from minigraph.state import State
 # 这样 `python examples/01_react_agent.py`（从仓库根跑）和
 # `cd examples && python 01_react_agent.py` 写的是同一个文件。
 _DB_PATH = Path(__file__).resolve().parent.parent / "minigraph.db"
+
+# 每个图用**独立的 thread**，且每次运行都换新的 —— 因为"给一个已存在的
+# thread 传输入"是**追加**语义（对齐 LangGraph）：输入会写到已有状态上。
+# 本示例每次都传入一份完整的初始状态，所以要的是"从头开始"，
+# 就得用一个新的 thread_id。
+_THREAD = uuid.uuid4().hex[:8]
 
 
 # ================================================================ A. 人工审批
@@ -97,7 +104,7 @@ def demo_hitl():
     print("A. Human-in-the-loop")
     print("=" * 64)
     app = build_draft_graph()
-    cfg = {"thread_id": "article-42", "debug": True}
+    cfg = {"thread_id": f"article-42-{_THREAD}", "debug": True}
 
     print_graph(app)
 
@@ -166,7 +173,7 @@ def demo_fanout():
     print("B. Map-Reduce 扇出（3 个子任务并行）")
     print("=" * 64)
     app = build_map_reduce()
-    cfg = {"thread_id": "article-43", "debug": True}
+    cfg = {"thread_id": f"article-43-{_THREAD}", "debug": True}
     print_graph(app)
 
     t0 = time.time()
