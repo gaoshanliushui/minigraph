@@ -64,14 +64,18 @@ def main() -> None:
     show("update(['y'])", c)
 
     print("\n=== BinaryOperatorAggregate（有 reducer 的状态字段）===")
-    c = BinaryOperatorAggregate("k", lambda old, new: old + new)
-    show("初始", c)
+    # 带 typ：初值 = typ()，一开局就可用（真实编译出来的图就是这样）
+    c = BinaryOperatorAggregate("k", lambda old, new: old + new, int)
+    show("初始（typ() = 0）", c)
     c.update([1])
     show("update([1])  —— 首次直接落盘", c)
     c.update([2])
     show("update([2])  —— reducer 合并", c)
     c.update([])
     show("update([])  —— 没人写它", c)
+    # 不带 typ：拿不到零值 -> 退化成 MISSING
+    c2 = BinaryOperatorAggregate("k2", lambda old, new: old + new)
+    show("不带 typ（退化成 MISSING）", c2)
 
     print("\n=== EphemeralValue（分支触发通道 branch:to:X）===")
     c = EphemeralValue("k", guard=False)

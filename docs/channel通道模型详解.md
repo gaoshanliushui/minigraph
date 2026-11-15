@@ -16,7 +16,7 @@
 > **这个通道现在有没有"可读的值"。**
 
 它和"版本号新不新"是**两条独立的轴**。节点被触发要两个同时成立
-（`runtime.py:617-640`）：
+（`runtime.py:852-875`）：
 
 ```python
 channels[chan].is_available()              # 轴一：有信号吗
@@ -33,7 +33,7 @@ and versions[chan] > seen[node][chan]      # 轴二：这信号是新来的吗
 
 > **返回 True = 通道的可用性（或内容）确实变了，值得推版本号。**
 
-所以"可用性变化"和"版本号推进"是绑在一起的：`_apply_writes`（`runtime.py:698-739`）
+所以"可用性变化"和"版本号推进"是绑在一起的：`_apply_writes`（`runtime.py:933-969`）
 只在 `update()` 返回 True 时才写 `versions[chan] = version`。
 
 而 `update([])`（空写入）在不同类型里含义**完全不同**，这是后面所有行为差异的根源：
@@ -45,6 +45,227 @@ and versions[chan] > seen[node][chan]      # 轴二：这信号是新来的吗
 | `Topic(accumulate=False)` | **清空队列** | True（若原来非空） |
 | `Topic(accumulate=True)` | no-op（继续累积） | False |
 | `NamedBarrierValue` | **no-op**（seen 不变） | False |
+
+---
+
+## 1.5 可用性什么时候被更改：按源码逐个入口
+
+> 本节回答："**这个通道的 `is_available()` 什么时候会从 False 变 True、
+> 什么时候会变回 False？**"
+>
+> 结论先行：**能改变可用性的只有三个方法** —— `update()`、`consume()`、`finish()`。
+> 而在 minigraph 的实际运行里，`finish()` **从没被调用过**，
+> `consume()` **只有屏障通道有实质行为**。
+>
+> 所以真正的问题收敛成：**`update()` 在什么时机被调用、传进去什么**。
+
+### 1.5.1 三个入口
+
+| 方法 | 谁能调它 | minigraph 里实际调用的地方 | 会不会改可用性 |
+| --- | --- | --- | --- |
+| `update(values)` | `_apply_writes`（正常写入）、`expire_unwritten`（空写自清）、`_write_state_channels`（写数据通道）、`_begin`（开局写入口信号） | 见 §1.5.2 | **会**（取决于类型和入参） |
+| `consume()` | `consume_triggers`（订阅者跑完后） | `runtime.py:175` | **只有屏障会**（重新武装） |
+| `finish()` | —— | **从未调用** | 不会 |
+
+`BaseChannel.consume()` 和 `BaseChannel.finish()` 的默认实现都返回 `False`
+（`channels.py:103-109`）—— 即"什么都没变"。整个 `channels.py` 里
+**只有 `NamedBarrierValue` 覆盖了 `consume()`**（`channels.py:397-402`）。
+
+### 1.5.2 `update()` 的四个调用点
+
+按调用时机排：
+
+| # | 调用点 | 代码 | 传什么 | 影响谁 |
+| --- | --- | --- | --- | --- |
+| ① | **开局** `__start__` 点亮入口 | `rt.channels[chan].update([None])`（`runtime.py:574`） | `[None]` | 入口点的 `branch:to:X` → **变可用** |
+| ② | **本步写入落地** `_apply_writes` | `ch.update(vals)`（`runtime.py:956`） | 本步该通道的**全部**写入值 | 数据通道 + 被写的触发通道 → **变可用** |
+| ③ | **写状态字段** `_write_state_channels` | `ch.update([val])`（`runtime.py:1021`） | 单个值 | 仅数据通道 → **变可用** |
+| ④ | **超步末尾自清** `expire_unwritten` | `ch.update([])`（`runtime.py:190`） | **空列表** | 没人写的通道 → **变不可用** |
+
+看 ③ 这一处有个容易忽略的细节：
+
+```python
+ch.update([val])          # _write_state_channels，runtime.py:1021
+```
+
+**它不看返回值。** 所以写数据通道**不会**推版本号 —— 这和 ② 不同
+（② 里 `changed = ch.update(vals)` 的返回值被用来决定推不推版本）。
+数据通道本来就不参与触发判定，不推版本没有影响。
+
+### 1.5.3 每个通道类型的可用性状态机
+
+下表是**逐类型、从源码读出来的**状态机。
+"变可用"指 `is_available()` 从 False 变 True，"变不可用"反之。
+
+#### `LastValue`（数据字段，无 reducer）
+
+```text
+                    update([v])              永远
+    False ──────────────────────────> True ─────────────> True
+```
+
+| 事件 | 可用性 | 说明 |
+| --- | --- | --- |
+| 构造 | False | `value = MISSING`（`channels.py:146`） |
+| `update([v])` | **False → True** | `value = values[-1]`（`channels.py:158`） |
+| `update([])` | 不变 | 直接 `return False`（`channels.py:149-150`） |
+| `update([v1, v2])` | 抛异常 | `ConcurrentWriteError`（`channels.py:151-157`） |
+
+**永不变回 False。** 一旦写过就一直可用。
+
+#### `BinaryOperatorAggregate`（数据字段，有 reducer）
+
+```text
+    构造（有 typ）  →  True（初值 typ()）──> 永远 True
+    构造（无 typ）  →  False ──update([v])──> True ──> 永远 True
+```
+
+| 事件 | 可用性 | 说明 |
+| --- | --- | --- |
+| 构造，**有** `typ` | **True** | 初值 = `typ()`，list→`[]`、int→`0`（`channels.py:209-214`） |
+| 构造，**无** `typ` | False | 造不出零值 → 退化成 `MISSING`（`channels.py:212-214`） |
+| `update([v])` | **→ True** | 首次写入直接落盘，之后走 reducer 合并（`channels.py:217-226`） |
+| `update([])` | 不变 | 返回 False（`channels.py:218-219`） |
+
+> ⚠️ **初值这件事容易被忽略**：真实编译出来的图里，带 reducer 的字段
+> **一开局就可用**（`typ` 从 `Annotated[T, reducer]` 里取出来传进去）。
+> 实测：
+>
+> ```text
+>   items    BinaryOperatorAggregate    value=[]       is_available=True
+>   n        BinaryOperatorAggregate    value=0        is_available=True
+>   plain    LastValue                  value=<missing> is_available=False
+> ```
+>
+> 所以 `get_state()` 拿到的状态里，**带 reducer 的字段从一开始就有零值**，
+> 不带 reducer 的字段则"没有就是没有"。
+
+#### `EphemeralValue`（`branch:to:X` 分支触发通道）
+
+```text
+    False ──update([None])──> True ──update([])──> False ──update([None])──> True
+                ↑                              ↑
+          哪怕值是 None                  自清（超步末尾）
+```
+
+| 事件 | 可用性 | 说明 |
+| --- | --- | --- |
+| 构造 | False | `value = MISSING`（`channels.py:267`） |
+| `update([None])` | **False → True** | `value = values[-1]`；**值是 None 也算可用**（`channels.py:281`） |
+| `update([])` | **True → False** | 自清（`channels.py:270-275`） |
+| `update([])`（已是空） | 不变 | 返回 False（`channels.py:274`）—— **不推版本号** |
+
+**这是唯一"生灭对称"的触发通道**：写进去变可用，没人写就变不可用。
+
+> `guard=True/False` 只影响"一步收到多个值"时是否报错（`channels.py:276-279`），
+> 与可用性无关。分支通道用 `guard=False`，因为两个并行节点同时
+> `Command(goto="x")` 是合法的。
+
+#### `Topic`（`__pregel_tasks` Send 队列）
+
+```text
+    accumulate=False:
+    False ──update([...])──> True ──update([])──> False
+
+    accumulate=True:
+    False ──update([...])──> True ─────────────> True（只增不减）
+```
+
+| 事件 | 可用性 | 说明 |
+| --- | --- | --- |
+| 构造 | False | `values = []`（`channels.py:317`） |
+| `update([...])` | **→ True** | `accumulate=False` 时**先清空再收**（`channels.py:319-324`） |
+| `update([])`，`accumulate=False` | **True → False** | 清空队列（`channels.py:320-323`） |
+| `update([])`，`accumulate=True` | 不变 | 继续累积（`channels.py:319`） |
+
+`accumulate=False` 时队列里**只有本超步写的 Send** —— 旧 Send 不会重复触发任务。
+
+#### `NamedBarrierValue`（`join:a+b:c` 屏障）
+
+```text
+    False ──update(["a"])──> False ──update(["b"])──> True
+                                        ↑
+    False <──consume()──────────────────┘   （重新武装）
+```
+
+| 事件 | 可用性 | 说明 |
+| --- | --- | --- |
+| 构造 | False | `seen = set()`（`channels.py:375`） |
+| `update(["a"])`（还差 b） | **不变（False）** | `seen` 加了 a，但没集齐（`channels.py:377-387`） |
+| `update(["b"])`（集齐） | **False → True** | `seen == names`（`channels.py:394`） |
+| `update([])` | **不变** | 循环体不执行 → `seen` 不变（`channels.py:378-380`） |
+| `consume()`（已集齐） | **True → False** | `seen = set()`，重新武装（`channels.py:397-402`） |
+| `consume()`（没集齐） | 不变 | 返回 False |
+
+**这是唯一一个"可用 ≠ 有值"的类型**：
+
+| 状态 | `seen` | `is_available()` | `get()` |
+| --- | --- | --- | --- |
+| 没人到 | `{}` | False | 抛 `EmptyChannelError` |
+| a 到了 | `{"a"}` | False | 抛 `EmptyChannelError` |
+| a、b 都到 | `{"a","b"}` | True | 返回 `None` |
+
+两个细节：
+
+1. **半满的屏障不会被自清误伤**。`update([])` 的循环体一次都不执行 → 返回 False
+   → `seen` 不变。否则 a、b 分两步到达时，b 的信号会在中间被抹掉。
+2. **满的屏障是被 `consume()` 重新武装的，不是被自清清掉的**。`consume()`
+   在"消费触发通道"步骤（`runtime.py:173-178`），**早于**自清步骤
+   （`expire_unwritten`），顺序上不会打架。
+
+### 1.5.4 一次超步里，可用性的完整变化顺序
+
+`_advance`（`runtime.py:715-734`）的**四步顺序不能换**，
+它决定了可用性在什么时候被改：
+
+```text
+① advance_watermarks(tasks)      只动 seen，不动通道
+② next_version()                 算下一个版本号
+③ consume_triggers(tasks, v)     屏障被 consume() 重新武装  ← 唯一让可用性变 False 的"写"
+④ _apply_writes(..., v)          本步写入落地 → 可用性变 True
+⑤ expire_unwritten(written, v)   没人写的通道 update([]) 自清 → 可用性变 False
+```
+
+对应到可用性：
+
+| 步 | 谁变可用 | 谁变不可用 |
+| --- | --- | --- |
+| ③ `consume_triggers` | —— | **已集齐的屏障**（`consume()` 重新武装） |
+| ④ `_apply_writes` | **本步被写的通道** | —— |
+| ⑤ `expire_unwritten` | —— | **本步没人写、但还可用着的通道** |
+
+所以一个超步结束时：
+
+- **被写过的通道** → 可用（下一步能被读到）
+- **没被写过的通道** → 不可用（被自清）
+- **已集齐的屏障** → 不可用（被重新武装，等下一轮）
+
+这正是"分支通道恰好活一个超步"的实现（§5.1）。
+
+> ⚠️ 注意 ③ 在 ④ **之前**：屏障先重新武装，再应用本步写入。
+> 顺序反了的话，屏障会在"本步有人写"的情况下被误判成"没人写"而清空。
+
+### 1.5.5 实测
+
+```bash
+.venv/bin/python scripts/exp_availability_lifecycle.py
+```
+
+逐类型打印每一步的 `is_available()`，覆盖：
+
+- `update()` 返回 True 但可用性没翻转（`Topic` 二次写入）
+- `update([])` 对数据通道是 no-op
+- `EphemeralValue` 写 `None` 也算可用
+- `EphemeralValue` 二次自清返回 False（不推版本）
+- `NamedBarrierValue` 的 `consume()` 是唯一让它变回不可用的入口
+- `LastValue` 写同一个值也返回 True（内容变了 ≠ 可用性变了）
+
+另有两个现成脚本：
+
+```bash
+.venv/bin/python scripts/channel_availability.py    # 逐类型打印可用性
+.venv/bin/python scripts/channel_inventory.py        # 真实图里开局各通道的可用性
+```
 
 ---
 
@@ -93,7 +314,7 @@ g.add_conditional_edges("d", ...)         # 条件边
 **数据通道只被读，不触发任何人。** 它们出现在 `_read_state()` 生成的快照里，
 节点通过 `state["字段名"]` 读到值；它们**不在任何节点的 `triggers` 里**。
 
-判定规则见 `channel_for_field()`（`channels.py:406-423`）：
+判定规则见 `channel_for_field()`（`channels.py:418-423`）：
 
 ```text
 reducer is None 或 reducer is LAST_VALUE  ->  LastValue
@@ -144,7 +365,7 @@ __start__  triggers=['__start__']                  writers=['branch:to:a']
 - `writers` = 会写谁（静态边 + 屏障边编译来的）
 - `branches` = 有几条条件边（运行时才决定写哪个 `branch:to:X`）
 
-反向索引 `trigger_to_nodes`（`runtime.py:214-218`）就是 `triggers` 的转置，
+反向索引 `trigger_to_nodes`（`runtime.py:309-312`）就是 `triggers` 的转置，
 调度时用它从"变化的通道"直接找到候选节点：
 
 ```text
@@ -209,7 +430,7 @@ def is_available(self) -> bool:
 
 ### 3.2 `EphemeralValue`（`channels.py:277`）—— 分支触发通道
 
-判据同上（`value is not MISSING`），但它**能被清掉**（`channels.py:257-262`）：
+判据同上（`value is not MISSING`），但它**能被清掉**（`channels.py:269-274`）：
 
 ```python
 def update(self, values):
@@ -273,7 +494,7 @@ def is_available(self) -> bool:
 两个细节：
 
 1. **半满的屏障不会被自清误伤**。`update([])` 的循环体一次都不执行 → 返回 False
-   → `seen` 不变（`channels.py:365-375`）。否则 a、b 分两步到达时，b 的信号
+   → `seen` 不变（`channels.py:377-387`）。否则 a、b 分两步到达时，b 的信号
    会在中间被抹掉。
 2. **满的屏障是被 `consume()` 重新武装的，不是被自清清掉的**。`consume()`
    （`channels.py:385-389`）在订阅者跑完后把 `seen` 清空 → 重新武装下一轮。
@@ -335,7 +556,7 @@ step N+2 ：若 a、b 又各写一次 -> seen={a,b} -> 又可用 -> c 再触发�
 
 ## 6. 可用性除了触发，还管三件事
 
-**① 快照里有没有这个字段**（`runtime.py:747`）
+**① 快照里有没有这个字段**（`runtime.py:976-984`）
 
 ```python
 state = {f: channels[f].get() for f in reducers
@@ -345,7 +566,7 @@ state = {f: channels[f].get() for f in reducers
 没写过的状态字段在节点眼里是**不存在**（`s["x"]` 抛 KeyError），不是 `None`。
 这个区别很实际：节点要区分"没这个字段"和"这个字段是 None"。
 
-**② checkpoint / `get_state` 的状态投影**（`runtime.py:763`）—— 同理，
+**② checkpoint / `get_state` 的状态投影**（`runtime.py:987-1000`）—— 同理，
 只含可用的数据通道；`branch:to:*` / `join:*` / `__pregel_tasks` 这些触发通道
 不会泄漏到用户状态里。
 
