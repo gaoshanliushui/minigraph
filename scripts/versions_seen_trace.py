@@ -189,8 +189,8 @@ def check_invariants() -> None:
 
     original = _RuntimeState.dump
 
-    def dump(self, tag: str) -> None:
-        original(self, tag)
+    def dump(self, tag: str, tasks: list | None = None) -> None:
+        original(self, tag, tasks)
         seen_hist.append({k: dict(v) for k, v in self.seen.items()})
         versions_hist.append(dict(self.versions))
 
