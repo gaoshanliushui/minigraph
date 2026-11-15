@@ -29,6 +29,7 @@ from minigraph.builder import StateGraph
 from minigraph.constants import END
 from minigraph.control import Send
 from minigraph.state import State
+from minigraph.utils import print_graph
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,9 @@ def scenario_barrier() -> None:
     g.add_edge("__start__", "b")
     g.add_edge(["a", "b"], "c")
     app = g.compile()
+
+    print_graph(app)
+
     print("c 的触发通道:", app.nodes["c"].triggers)
     for _ in app.stream({}, {"debug": True}):
         pass
@@ -290,9 +294,9 @@ def scenario_map_reduce() -> None:
 
 
 def main() -> None:
-    instrument()
-    scenario_linear()
-    scenario_loop()
+    # instrument()
+    # scenario_linear()
+    # scenario_loop()
     scenario_barrier()
     scenario_send()
     scenario_map_reduce()
