@@ -193,21 +193,106 @@ class _RuntimeState:
                     self.updated.add(chan)
 
     # -- 调试 -------------------------------------------------------------
-    def dump(self, tag: str) -> None:
+    def dump(self, tag: str, tasks: list[Task] | None = None) -> None:
         """
-        把三张表打出来 —— 调试超步循环时最有用的一张图。
+        把触发判定这件事按**节点**摊开 —— 谁醒、为什么醒、水位线落后多少。
 
-        只打**触发通道**（branch:to:* / join:* / __pregel_tasks）：
-        数据通道（状态字段）一旦被写就**始终可用**，而且从不参与触发判定，
-        混进来只会淹没真正要看的信息 —— 谁被唤醒了、水位线推到哪了。
+        触发判定就是一条式子（见 _triggers）：
+
+            通道可用 且  versions[chan] > seen[node][chan]
+
+        之前这里是三张平铺表（versions / seen / avail），判定条件的两端
+        却被拆到两行里，得在脑子里做减法。现在每节点一行，直接把差值算出来。
+
+        只列**触发通道**（branch:to:* / join:*）：数据通道（状态字段）一旦
+        被写就始终可用，从不参与触发判定，混进来只会淹没真正要看的信息。
+
+        `tasks` 是本超步调度器真正的任务表。传进来就能标出
+        "版本够了但没被调度"和"会被唤醒"的区别；不传就只按版本判定推断。
         """
         trig = {c: ch for c, ch in self.channels.items() if c not in self.reducers}
         print(f"  {tag}")
         print("    versions:", {k: v for k, v in sorted(self.versions.items())
                               if k not in self.reducers})
-        print("    seen    :", {k: dict(sorted(v.items())) for k, v in sorted(self.seen.items())})
         print("    avail   :", {c: trig[c].get() for c in sorted(trig)
                                if trig[c].is_available()})
+        print("    nodes:")
+        for name in sorted(self.nodes):
+            spec = self.nodes[name]
+            if spec.is_start:
+                continue
+            print("      " + self._dump_node(name, spec, trig, tasks))
+
+    def _dump_node(self, name: str, spec: NodeSpec, trig: dict[str, BaseChannel],
+                   tasks: list[Task] | None) -> str:
+        """
+        单个节点的一行诊断。
+
+        方括号里是**水位线状态**（不是"跑过几次"）：
+
+          pull        有水位线，按版本差判定 versions[chan] > seen[node][chan]
+          push-only   跑过但水位线为空 —— PUSH（Send）来的，绕开分支通道
+          no-watermark  没有水位线 —— 只要通道可用就触发，不看版本
+
+        唤醒方式也有两种：PULL（版本触发）和 PUSH（Send 队列）。
+        PUSH 唤醒的节点**不参与版本判定**（水位线是空的），
+        把两者混在一起显示会让人误以为它是被版本差唤醒的。
+        """
+        node_seen = self.seen.get(name)
+        if node_seen is None:
+            state = "no-watermark"    # 没有水位线：只看通道可用性
+        elif not node_seen:
+            state = "push-only"       # 跑过，但水位线是空的（PUSH 轨道）
+        else:
+            state = "pull"
+
+        # 水位线明细：每个触发通道一行 "chan=水位(版本 Δ)"
+        details: list[str] = []
+        for chan in spec.triggers:
+            ch = trig.get(chan)
+            version = self.versions.get(chan, 0)
+            if node_seen is None:
+                # 没有水位线：只有"通道可用"这一条判据，不看版本
+                mark = "可用" if ch is not None and ch.is_available() else "不可用"
+                details.append(f"{chan}=-{version} [{mark}]")
+                continue
+            watermark = node_seen.get(chan, 0)
+            delta = version - watermark
+            mark = "可用" if ch is not None and ch.is_available() else "不可用"
+            details.append(f"{chan}={watermark}(v{version} Δ{delta:+d}) [{mark}]")
+
+        verdict = self._dump_verdict(name, spec, node_seen, tasks)
+        return f"{name:<14} [{state:<9}] {'  '.join(details)}  -> {verdict}"
+
+    def _dump_verdict(self, name: str, spec: NodeSpec,
+                      node_seen: dict[str, int] | None,
+                      tasks: list[Task] | None) -> str:
+        """
+        这个节点本超步醒不醒？如果醒，是被什么叫醒的？
+
+        两种唤醒方式：
+          PULL  通道版本触发 —— 判据是上面那条版本差
+          PUSH  Send 队列触发 —— 每个 Send 变一个任务，**绕过版本判定**
+        """
+        if tasks is None:
+            # 没有任务表可依：只按版本判定推断，标出 PULL。
+            will = _triggers(self.channels, self.versions, node_seen, spec.triggers)
+            return "会被唤醒(PULL)" if will else "—"
+
+        mine = [t for t in tasks if t.name == name]
+        if not mine:
+            return "—"
+        # 有 Send 的就是 PUSH；否则是 PULL。
+        if any(t.is_push for t in mine):
+            n_push = sum(1 for t in mine if t.is_push)
+            n_pull = len(mine) - n_push
+            parts = []
+            if n_push:
+                parts.append(f"PUSH×{n_push}")
+            if n_pull:
+                parts.append(f"PULL×{n_pull}")
+            return "会被唤醒(" + "+".join(parts) + ")"
+        return "会被唤醒(PULL)"
 
 
 class CompiledGraph:
@@ -522,7 +607,9 @@ class CompiledGraph:
                 raise RuntimeError(f"超过 recursion_limit={limit}，疑似死循环")
 
             if debug:
-                rt.dump(f"step {rt.step + 1} 触发前")
+                # tasks 就是调度器真正的决定，直接用它判断"谁醒、怎么醒"，
+                # 不另算一遍 —— 免得诊断输出和实际调度对不上。
+                rt.dump(f"step {rt.step + 1} 触发前", tasks=tasks)
 
             # ② 读快照：同一超步的所有节点看到同一份状态
             snapshot = rt.read()

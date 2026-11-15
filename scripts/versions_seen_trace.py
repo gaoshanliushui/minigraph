@@ -36,13 +36,17 @@ from minigraph.state import State
 # ---------------------------------------------------------------------------
 
 def instrument() -> None:
-    """给 _RuntimeState 打上探针，把完整的 seen 也打出来。"""
+    """给 _RuntimeState 打上探针，把完整的 seen 也打出来。
+
+    dump 现在已经是「每节点一行」的形态，seen 的完整表格是冗余的；
+    这里保留它只是为了对照 —— 确认逐节点视图没有漏掉节点。
+    """
     from minigraph.runtime import _RuntimeState
 
     original = _RuntimeState.dump
 
-    def dump(self, tag: str) -> None:
-        original(self, tag)
+    def dump(self, tag: str, tasks: list | None = None) -> None:
+        original(self, tag, tasks)
         print(f"      [全部 seen] {self.seen}")
 
     _RuntimeState.dump = dump
