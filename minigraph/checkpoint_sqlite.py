@@ -108,8 +108,8 @@ CREATE TABLE IF NOT EXISTS writes (
 # parent_id 是表列，也不进 blob。
 _CKPT_FIELDS = (
     "id", "step", "values", "next", "tasks", "interrupt", "interrupts",
-    "resumes", "slots", "channel_values", "channel_versions", "versions_seen",
-    "delta_counters",
+    "resumes", "slots", "task_writes", "channel_values", "channel_versions",
+    "versions_seen", "delta_counters",
 )
 
 
@@ -189,6 +189,8 @@ def _ckpt_from_dict(d: dict) -> Checkpoint:
         interrupts=list(d["interrupts"]),
         resumes={k: list(v) for k, v in d["resumes"].items()},
         slots=list(d["slots"]),
+        task_writes={k: [(c, v) for c, v in vals]
+                     for k, vals in (d.get("task_writes") or {}).items()},
         channel_values=d["channel_values"],
         channel_versions=d["channel_versions"],
         versions_seen=d["versions_seen"],

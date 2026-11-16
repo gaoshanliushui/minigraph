@@ -109,6 +109,18 @@ class Checkpoint:
     # step 号会漂移，之前答复过的值就配不上槽位了。
     slots: list[dict[str, Any]] = field(default_factory=list)
 
+    # 挂起那一批里**已经跑成功**的任务写出的通道写入：槽位 -> [(通道, 值)]。
+    #
+    # 为什么需要它：minigraph 遇到 interrupt() 会让**整个超步**回滚，
+    # 恢复时整批重跑。可并行跑的一批里，往往只有一两个任务挂了，
+    # 兄弟任务已经跑完 —— 整批重跑会让它们**再执行一次**，
+    # 有副作用的工具（写文件、发请求）就被重复触发了。
+    #
+    # 对齐 LangGraph 的 `_reapply_writes_to_succeeded_nodes`：
+    # 已完成任务的写入被存下来，恢复时直接**用掉**（不重跑），
+    # 只有挂起的那个任务真的重跑。
+    task_writes: dict[str, list[tuple[str, Any]]] = field(default_factory=dict)
+
     # ---- 通道模型的持久化状态 ----------------------------------------
     #
     # values 是**扁平的状态投影**（只含状态字段，给 get_state 用）；
@@ -167,6 +179,7 @@ class Checkpoint:
             interrupts=_c.deepcopy(self.interrupts),
             resumes=_c.deepcopy(self.resumes),
             slots=_c.deepcopy(self.slots),
+            task_writes=_c.deepcopy(self.task_writes),
             channel_values=_c.deepcopy(self.channel_values),
             channel_versions=_c.deepcopy(self.channel_versions),
             versions_seen=_c.deepcopy(self.versions_seen),

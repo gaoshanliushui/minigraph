@@ -139,6 +139,17 @@ class _RuntimeState:
     run_step: int = 0
     delta_counters: dict[str, tuple[int, int]] = field(default_factory=dict)
     input_writes: list[tuple[str, Any]] = field(default_factory=list)
+    # 挂起那一批里**已经跑成功**的任务写出的通道写入：槽位 -> [(通道, 值)]。
+    #
+    # 为什么要单独记：minigraph 遇到 interrupt() 会让整个超步回滚，
+    # 恢复时整批重跑。可并行跑的一批里往往只有一两个任务挂了，
+    # 兄弟任务已经跑完 —— 整批重跑会让它们**再执行一次**，
+    # 有副作用的工具（写文件、发请求）就被重复触发。
+    #
+    # 这里存下成功任务的写入，恢复时直接**用掉**（不重跑），
+    # 只有挂起的那个任务真的重跑。对齐 LangGraph 的
+    # `_reapply_writes_to_succeeded_nodes`。
+    task_writes: dict[str, list[tuple[str, Any]]] = field(default_factory=dict)
     # 本次运行最近一次落盘的 checkpoint id。下一份 checkpoint 的
     # parent_id 就是它 —— 从历史点分叉时，恢复源（而不是存储里最新的
     # 那份）才是新 checkpoint 的父节点。
@@ -721,6 +732,10 @@ class CompiledGraph:
                                 (snap.delta_counters or {}).items()},
                 input_writes=input_writes,
                 last_ckpt_id=snap.id,
+                # 挂起那一批里已经跑成功的任务的写入：恢复时直接用掉，
+                # 不重跑（否则有副作用的兄弟任务会被执行两次）。
+                task_writes={k: list(v) for k, v in
+                             (snap.task_writes or {}).items()},
             )
             # checkpoint 目前不保存 updated_channels；恢复后的第一轮检查
             # 所有节点，之后仍走 changed-channel 反向索引。
@@ -859,21 +874,57 @@ class CompiledGraph:
             snapshot = rt.read()
 
             # ③ 并发跑本批任务
-            runs = self._assign_slots(tasks, rt.step, snap)
+            all_runs = self._assign_slots(tasks, rt.step, snap)
+
+            # 上一次挂起时已经**跑成功**的兄弟任务：它们的写入被存进了
+            # checkpoint，这里直接用掉、不重跑（对齐 LangGraph 的
+            # `_reapply_writes_to_succeeded_nodes`）。
+            # 不这么做的话，有副作用的工具会被执行两次。
+            runs, reused = self._split_reused(all_runs, rt)
+
             # 本超步开始前的 resume 队列快照。挂起时整步回滚，已经被
             # 消费掉的 resume 值必须还原 —— 否则重跑时取不到。
             store_before = {k: list(v) for k, v in (_ctx().get("resume") or {}).items()}
             results = _execute_batch(self.nodes, runs, snapshot)
 
             # ④ 收写入：把节点返回值翻译成「(节点, 通道, 值)」
-            writes, ran, hits = self._collect_writes(runs, results, snapshot)
+            _fresh, _ran, hits, task_writes = self._collect_writes(
+                runs, results, snapshot)
+            # 按**原来的任务顺序**把写入拼回去：复用来的任务（没重跑）
+            # 和刚跑的任务混在同一个列表里，位置按 all_runs 走 ——
+            # 写入的顺序决定 reducer 的合并顺序（operator.add 按序追加），
+            # 顺序乱了，状态里的元素次序就跟着乱。
+            writes: list[tuple[str, str, Any]] = []
+            ran: list[str] = []
+            for task, slot in all_runs:
+                entry = reused.get(slot)
+                if entry is not None:
+                    saved = entry[1]
+                    for chan, value in saved:
+                        writes.append((task.name, chan, value))
+                    ran.append(task.name)
+                    # 本步挂起时，这些写入要**连同复用来的那些一起**存进
+                    # checkpoint，否则下一轮恢复时它们会被重新执行一次。
+                    task_writes[slot] = saved
+                    continue
+                for chan, value in task_writes.get(slot, ()):
+                    writes.append((task.name, chan, value))
+                ran.append(task.name)
 
             # 有节点挂起 -> 整步作废：不应用任何写入、不推进版本、不动水位线。
-            # 于是恢复时算触发会得出**同一批任务**，整批重跑。
+            # 于是恢复时算触发会得出**同一批任务**，整批重跑 ——
+            # 但已经跑成功的那些不重跑（它们的写入在 task_writes 里）。
             if hits:
-                self._suspend(rt, runs, hits, store_before, saver, thread_id)
+                # slots 要记**全部**任务（含复用的那些）：恢复时
+                # _assign_slots 靠它把每个任务还原成当初的槽位。
+                self._suspend(rt, all_runs, hits, store_before, saver, thread_id,
+                              task_writes)
                 yield hits[0].task.name, rt.step + 1, {}
                 return
+
+            # 这一步提交了：复用来的写入已经落进通道，清掉，
+            # 免得后面的超步又把它们应用一遍。
+            rt.task_writes = {}
 
             # ⑤⑥ 落盘：推水位线、消费屏障、应用写入、清理过期通道
             self._advance(rt, tasks, writes)
@@ -954,16 +1005,25 @@ class CompiledGraph:
         同时挑出本步**所有**挂起的任务（有人调了 interrupt()）。
         多个节点并行挂起时，它们都要被记下来 —— 少记一个，
         那个节点重跑时会永远等不到自己的 resume 值。
+
+        还会按**槽位**记下每个成功任务的写入（task_writes）：
+        挂起时这些写入会被存进 checkpoint，恢复时直接用掉、不重跑，
+        免得有副作用的兄弟任务被执行两次（见 _RuntimeState.task_writes）。
         """
         writes: list[tuple[str, str, Any]] = []
         ran: list[str] = []
         hits: list[_Hit] = []
+        task_writes: dict[str, list[tuple[str, Any]]] = {}
         for (task, slot), out in zip(runs, results):
             name = task.name
             if isinstance(out, GraphInterrupt):
                 # 挂起 = 本超步作废：已提交的写入会被丢弃，恢复后整批重跑。
                 # 这正是 BSP 屏障（"一步要么全提交，要么全不提交"）的含义，
                 # 也是 checkpoint 存在**超步级**的根本原因 —— 所以节点要幂等。
+                #
+                # 但"整批重跑"不能连**已经跑成功的兄弟任务**一起重跑：
+                # 它们有副作用，重跑就是重复执行。所以它们的写入单独存下来
+                # （task_writes），恢复时直接用掉。
                 hits.append(_Hit(task=task, slot=slot, value=out.value))
                 continue
             if isinstance(out, _NodeError):
@@ -972,7 +1032,31 @@ class CompiledGraph:
             node_writes = _normalize(name, out, snapshot, self.nodes, self.channels,
                                      self.reducers)
             writes.extend((name, c, v) for c, v in node_writes)
-        return writes, ran, hits
+            task_writes[slot] = [(c, v) for c, v in node_writes]
+        return writes, ran, hits, task_writes
+
+    # -- ④b 复用已成功的兄弟任务 -------------------------------------------
+    def _split_reused(self, runs, rt: _RuntimeState):
+        """
+        把这一批任务分成"要跑的"和"上一轮已经跑成功的"。
+
+        挂起时整步回滚，但**已经跑成功的兄弟任务不该重跑** ——
+        它们可能有副作用（写文件、发请求），重跑就是重复执行。
+        它们的写入被存进了 checkpoint.task_writes，这里直接取用。
+
+        返回 (要跑的任务, {槽位: ((任务, 槽位), [(通道, 值)])})。
+        """
+        if not rt.task_writes:
+            return runs, {}
+        reused: dict[str, tuple[tuple[Task, str], list[tuple[str, Any]]]] = {}
+        pending = []
+        for (task, slot) in runs:
+            saved = rt.task_writes.get(slot)
+            if saved is None:
+                pending.append((task, slot))
+            else:
+                reused[slot] = ((task, slot), saved)
+        return pending, reused
 
     # -- ⑤⑥ 落盘 -----------------------------------------------------------
     def _advance(self, rt: _RuntimeState, tasks: list[Task],
@@ -999,17 +1083,23 @@ class CompiledGraph:
     # -- 挂起 --------------------------------------------------------------
     def _suspend(self, rt: _RuntimeState, runs: list[tuple[Task, str]],
                  hits: list[_Hit], store_before: dict[str, list[Any]],
-                 saver, thread_id: str | None) -> None:
+                 saver, thread_id: str | None,
+                 task_writes: dict[str, list[tuple[str, Any]]] | None = None
+                 ) -> None:
         """
         挂起：冻结在 interrupt 处，存一份 checkpoint，然后结束这次运行。
 
         冻结的是**超步边界**：本步的写入一律不应用、版本一律不推进、
         水位线一律不动。于是恢复时算触发会得出**同一批任务**，整批重跑。
 
-        存三样和恢复有关的东西：
+        存四样和恢复有关的东西：
           interrupts  本步**所有**挂起点（多个节点同时挂起时要全记）
           resumes     已收集到的 resume 值（整步回滚，重跑时还要用）
           slots       本批任务的槽位分配（重跑时槽位不能漂移）
+          task_writes 本步**已经跑成功**的任务写出的通道写入 ——
+                      恢复时直接用掉，不重跑（否则有副作用的兄弟任务
+                      会被执行两次；对齐 LangGraph 的
+                      `_reapply_writes_to_succeeded_nodes`）
         """
         tasks = [t for t, _ in runs]
         this_step = rt.step + 1          # 挂起这一步的编号 = 它本该成为的超步号
@@ -1028,6 +1118,7 @@ class CompiledGraph:
             resumes={k: list(v) for k, v in store_before.items()},
             slots=[{"name": t.name, "idx": t.idx, "push": t.is_push, "slot": s}
                    for (t, s) in runs],
+            task_writes={k: list(v) for k, v in (task_writes or {}).items()},
             channel_values={c: ch.checkpoint() for c, ch in rt.channels.items()},
             channel_versions=dict(rt.versions),
             versions_seen={k: dict(v) for k, v in rt.seen.items()},
@@ -1041,7 +1132,7 @@ class CompiledGraph:
             # 另外记一条 __interrupt__ 事件（值 = 本步所有挂起点的
             # payload）：writes 表因此能直接回答"这份 checkpoint 为什么
             # 挂起"。它只是日志，恢复机制仍靠上面的 interrupts/resumes/
-            # slots 字段（minigraph 整步回滚，与 LangGraph 不同）。
+            # slots/task_writes 字段。
             pending_writes=([(INTERRUPT, [h.value for h in hits])]
                             + list(rt.input_writes)),
             delta_counters=dict(rt.delta_counters),

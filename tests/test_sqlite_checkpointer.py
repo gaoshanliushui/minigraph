@@ -323,6 +323,53 @@ def test_user_dict_that_looks_like_a_tag_is_left_alone():
     assert saver.get("t").values == {"__mg_type__": "tuple"}
 
 
+def test_task_writes_survive_round_trip():
+    """挂起时存下的"已成功任务的写入"必须能原样读回来。"""
+    saver = SqliteSaver(":memory:")
+    ck = Checkpoint(
+        id=saver.new_id(), step=1, values={}, next=(), tasks=[],
+        task_writes={"effect@2#push:0": [("log", ["effect"]),
+                                        ("branch:to:wait", None)]},
+    )
+    saver.put("t", ck)
+    back = saver.get("t")
+    assert back.task_writes == {
+        "effect@2#push:0": [("log", ["effect"]), ("branch:to:wait", None)]}
+
+
+def test_successful_sibling_is_not_reexecuted_with_sqlite(saver):
+    """SQLite 版：挂起回滚后，跑成功的兄弟任务同样不该重跑。"""
+    executed = []
+
+    class T(State):
+        log: Annotated[list, operator.add]
+
+    def effect(s):
+        executed.append("effect")
+        return {"log": ["effect"]}
+
+    def waits(s):
+        return {"log": [f"wait:{interrupt('wait')}"]}
+
+    g = StateGraph(T)
+    g.add_node("fork", lambda s: [Send("effect", {}), Send("wait", {})])
+    g.add_node("effect", effect)
+    g.add_node("wait", waits)
+    g.add_edge(START, "fork")
+    g.add_edge("fork", "effect")
+    g.add_edge("fork", "wait")
+    g.add_edge("effect", "wait")
+    g.add_edge("wait", END)
+
+    app = g.compile(checkpointer=saver)
+    cfg = {"thread_id": "sqlite-no-reexec"}
+    app.invoke({"log": []}, cfg)
+    assert executed == ["effect"]
+    out = app.invoke(None, {**cfg, "resume": "ok"})
+    assert executed == ["effect"]
+    assert out["log"] == ["effect", "wait:ok"]
+
+
 def test_unserializable_value_raises_clearly():
     class Weird:
         pass

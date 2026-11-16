@@ -54,6 +54,7 @@ from typing import Annotated, Callable
 
 from minigraph.builder import StateGraph
 from minigraph.constants import END
+from minigraph.control import Send
 from minigraph.state import DeltaChannel, State, add_messages, merge_dict
 from minigraph.tools import Tool, tool
 
@@ -91,10 +92,33 @@ class DeepAgentState(State):
     messages: Annotated[list, DeltaChannel(add_messages, list)]
     todos: list                              # write_todos 全量替换（last-write-wins）
     files: Annotated[dict, merge_dict]       # 虚拟文件系统：路径 -> 内容（浅合并）
+    # 并行工具任务的结果暂存：{调用序号: tool_result block}。
+    # 每个工具任务只写自己那一项（merge_dict 浅合并，并发安全），
+    # 由 tools_join 节点按序号排好序、拼成**一条** user 消息。
+    tool_results: Annotated[dict, merge_dict]
 
 
 def _mid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def _answered_tool_call_ids(messages: list[dict]) -> set[str]:
+    """已经有 tool_result 的 tool_use id。
+
+    对齐 LangGraph 的 pending_tool_calls 过滤（factory.py:2021-2025）：
+    已经在历史里拿到结果的调用不再重复派发。
+    """
+    answered: set[str] = set()
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") is not None):
+                answered.add(block["tool_use_id"])
+    return answered
 
 
 # ---------------------------------------------------------------------------
@@ -269,42 +293,90 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
                               "content": content}]}
 
     def tool_node(state: DeepAgentState) -> dict:
+        """执行**一个**工具调用（对齐 LangGraph 的 Send("tools", [call])）。
+
+        每个待执行调用是一个独立的 Send 任务，因此这里只处理一个调用：
+        ``state["__tool_call__"]`` 是 Send 带来的调用本身，
+        ``state["__tool_index__"]`` 是它在原始 tool_use 列表里的序号
+        （用来把并行结果排回原顺序）。
+
+        结果不直接写进 messages，而是暂存到 state["tool_results"]，
+        由 tools_join 节点拼成一条 user 消息 —— Anthropic Messages 协议
+        要求同一条 assistant 的多个 tool_use 之后紧跟**一条** user 消息，
+        其 tool_result block 与 tool_use 一一对应。
+        """
+        call = state.get("__tool_call__")
+        if call is None:                       # 直接走到 tools 节点（没有 Send）
+            return {}
+        index = state.get("__tool_index__", 0)
+        t = registry.get(call.get("name"))
+
+        def _exec(request: ToolRequest) -> str:
+            if t is None:
+                return f"错误：未知工具 {request.name!r}"
+            if isinstance(t, _StateTool):
+                text, upd = t.state_fn(state, request.args)
+                if upd:
+                    # state 工具的副作用（todos / files）随本次结果一起提交。
+                    state.setdefault("_state_tool_updates", {}).update(upd)
+                return text
+            return str(t.invoke(request.args))
+
+        out = stack.tool_call(ToolRequest(call, state=state), _exec)
+        block = {"type": "tool_result", "tool_use_id": call["id"],
+                 "content": out}
+        update = {"tool_results": {index: block}}
+        for key, value in (state.get("_state_tool_updates") or {}).items():
+            update[key] = value
+        return update
+
+    def tools_join(state: DeepAgentState) -> dict:
+        """把并行工具任务的结果按原顺序拼成**一条** user 消息。
+
+        tool_results 是 {序号: tool_result block}，序号来自原始 tool_use
+        列表的位置 —— 并行任务的完成顺序不确定，但序号是确定的，
+        所以这里按序号排序后拼接，顺序与模型的调用顺序一致。
+        """
+        results = state.get("tool_results") or {}
+        if not results:
+            return {}
+        ordered = [results[key] for key in sorted(results, key=lambda k: int(k))]
+        return {"messages": [{"id": _mid("tool"), "role": "user",
+                              "content": ordered}],
+                "tool_results": {}}
+
+    def route_to_tools(state: DeepAgentState):
+        """模型 -> 工具：每个待执行调用派一个并行任务。
+
+        对齐 LangGraph 的 ``[Send("tools", [tool_call]) for tool_call in
+        pending_tool_calls]``（factory.py::_make_model_to_tools_edge）：
+        N 个工具调用 = N 个并行 task，而不是一个 task 里串行跑 N 次。
+
+        已经拿到结果的调用不再重复派发（对齐 pending_tool_calls 的
+        "id 不在 tool_message_ids 里" 过滤）。
+        """
         last = state["messages"][-1]
-        calls = [b for b in last["content"] if b.get("type") == "tool_use"]
-        results, extra = [], {}
-        for c in calls:
-            t = registry.get(c.get("name"))
-
-            def _exec(request: ToolRequest, _t=t) -> str:
-                if _t is None:
-                    return f"错误：未知工具 {request.name!r}"
-                if isinstance(_t, _StateTool):
-                    text, upd = _t.state_fn(state, request.args)
-                    for k, v in (upd or {}).items():
-                        if k == "files":
-                            extra.setdefault("files", {}).update(v)
-                        else:
-                            extra[k] = v
-                    return text
-                return str(_t.invoke(request.args))
-
-            out = stack.tool_call(ToolRequest(c, state=state), _exec)
-            results.append({"type": "tool_result", "tool_use_id": c["id"],
-                            "content": out})
-        return {**extra, "messages": [{"id": _mid("tool"), "role": "user",
-                                       "content": results}]}
-
-    def should_continue(state: DeepAgentState) -> str:
-        last = state["messages"][-1]
-        has_call = last["role"] == "assistant" and any(
-            b.get("type") == "tool_use" for b in last["content"])
-        return "tools" if has_call else END
+        if last.get("role") != "assistant":
+            return END
+        calls = [b for b in last.get("content") or []
+                 if isinstance(b, dict) and b.get("type") == "tool_use"]
+        if not calls:
+            return END
+        answered = _answered_tool_call_ids(state["messages"])
+        pending = [c for c in calls if c.get("id") not in answered]
+        if not pending:
+            return END
+        return [Send("tools", {"__tool_call__": call,
+                               "__tool_index__": index})
+                for index, call in enumerate(calls) if call.get("id") not in answered]
 
     # 统一组装：合并中间件声明的 state 字段，并接入完整 create_agent 拓扑。
     g = StateGraph(agent_state_schema(DeepAgentState, stack))
     g.add_node("model", call_model)
     g.add_node("tools", tool_node)
-    wire_middleware_graph(g, stack, route=should_continue)
+    g.add_node("tools_join", tools_join)
+    wire_middleware_graph(g, stack, route=route_to_tools,
+                          tools_node="tools", join_node="tools_join")
     return g.compile(checkpointer=checkpointer)
 
 
