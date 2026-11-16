@@ -722,7 +722,10 @@ def wire_middleware_graph(g, stack: "MiddlewareStack", *,
             )
             if resolved is not None:
                 return resolved
-            return _route(state)
+            destination = _route(state)
+            # 业务路由只知道 END；图存在 after_agent 钩子时，真正的结束
+            # 分支必须先进入收尾链，不能直接绕过它跳到图终点。
+            return default_end if destination == END else destination
 
         destinations = [default_end]
         # 没有工具节点的图不把 "tools" 列为合法目的地
