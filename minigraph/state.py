@@ -20,8 +20,12 @@ from .constants import LAST_VALUE, MISSING, Reducer
 
 __all__ = [
     "LAST_VALUE", "State", "add_messages", "merge_dict",
-    "DeltaChannel", "BatchReducer",
+    "DeltaChannel", "BatchReducer", "REMOVE_ALL_MESSAGES",
 ]
+
+#: 与 LangGraph 相同的消息清空哨兵。remove-all 后面的消息会按原顺序重建列表，
+#: 因而中间件可以在一次 reducer 更新里修复历史顺序，而不只是追加到末尾。
+REMOVE_ALL_MESSAGES = "__remove_all__"
 
 
 # 消息列表 reducer：按 id 追加/更新，语义对齐 langgraph 的 add_messages。
@@ -46,6 +50,12 @@ def add_messages(old, new):
     out = list(old)
     for msg in new:
         mid = msg.get("id") if isinstance(msg, Mapping) else getattr(msg, "id", None)
+        msg_type = msg.get("type") if isinstance(msg, Mapping) else getattr(msg, "type", None)
+        msg_role = msg.get("role") if isinstance(msg, Mapping) else getattr(msg, "role", None)
+        if mid == REMOVE_ALL_MESSAGES and (msg_type == "remove" or msg_role == "remove"):
+            # 清空后继续处理本批后续消息：[remove_all, *rebuilt] 是原子重建。
+            out = []
+            continue
         idx = next((i for i, m in enumerate(out)
                     if (m.get("id") if isinstance(m, Mapping) else getattr(m, "id", None)) == mid), None
                    ) if mid else None

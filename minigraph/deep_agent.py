@@ -30,8 +30,9 @@
             派一个独立子代理跑完整 ReAct 回环（独立消息历史），
             主对话只拿到它的最终结论；子代理继承同一个 backend
 
-Summarization 默认启用，可用 summarization=False 关闭；skills=["/skills"]
-会自动创建 SkillsMiddleware。interrupt_on={"write_file": True} 会自动创建
+Summarization 默认启用，可用 summarization=False 关闭；PatchToolCallsMiddleware
+默认修复历史中的悬空 tool_use；skills=["/skills"] 会自动创建 SkillsMiddleware。
+interrupt_on={"write_file": True} 会自动创建
 HumanInTheLoopMiddleware（需要 checkpointer），让主代理在指定工具执行前挂起，
 由调用方审批后 resume。显式传入的同名中间件替换默认项，其余中间件插在核心栈
 之后、Skills/HITL 之前。与真实 deepagents 仍有差异：无 memory/response_format；
@@ -57,6 +58,7 @@ from .middleware import (
     InterruptOnConfig,
     MiddlewareStack,
     ModelRequest,
+    PatchToolCallsMiddleware,
     SkillsMiddleware,
     ToolRequest,
     agent_state_schema,
@@ -249,6 +251,7 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
         base_middleware.append(FilesystemMiddleware(backend=backend))
     if summarization:
         base_middleware.append(create_summarization_middleware(model, backend))
+    base_middleware.append(PatchToolCallsMiddleware())
     tail_middleware = []
     if skills:
         if backend is None:

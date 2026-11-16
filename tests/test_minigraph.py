@@ -10,7 +10,13 @@ from minigraph.checkpoint import InMemorySaver
 from minigraph.constants import END, START
 from minigraph.context import interrupt
 from minigraph.control import Command, Send
-from minigraph.state import LAST_VALUE, State, add_messages, merge_dict
+from minigraph.state import (
+    LAST_VALUE,
+    REMOVE_ALL_MESSAGES,
+    State,
+    add_messages,
+    merge_dict,
+)
 
 
 # ---------------------------------------------------------------- 1. 基本流转
@@ -99,6 +105,19 @@ def test_add_messages_updates_by_id_instead_of_appending():
     g.add_edge("a", "b")
     out = g.compile().invoke({"msgs": []})
     assert out["msgs"] == [{"id": 1, "c": "v2"}]
+
+
+def test_add_messages_remove_all_atomically_rebuilds_history():
+    old = [{"id": "old-1"}, {"id": "old-2"}]
+    rebuilt = [
+        {"id": "old-1", "content": "updated"},
+        {"id": "patch", "content": "inserted"},
+        {"id": "old-2"},
+    ]
+    remove_all = {"id": REMOVE_ALL_MESSAGES, "role": "remove", "content": ""}
+
+    assert add_messages(old, [remove_all, *rebuilt]) == rebuilt
+    assert old == [{"id": "old-1"}, {"id": "old-2"}]
 
 
 # ---------------------------------------------------------------- 3. 并行 / Send

@@ -14,12 +14,14 @@ from minigraph.checkpoint import InMemorySaver
 from minigraph.deep_agent import create_deep_agent
 from minigraph.middleware import (
     ModelRequest,
+    PatchToolCallsMiddleware,
     SkillsMiddleware,
     SummarizationMiddleware,
     ToolRequest,
     compute_summarization_defaults,
     create_summarization_middleware,
 )
+from minigraph.state import REMOVE_ALL_MESSAGES
 
 
 def _skill(name, description="Use this skill", *, body=None, extra=""):
@@ -95,6 +97,60 @@ def _tool_pair():
         ]},
         _msg(4, "latest"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Patch tool calls
+# ---------------------------------------------------------------------------
+
+def test_patch_tool_calls_noop_for_empty_or_complete_history():
+    mw = PatchToolCallsMiddleware()
+    assert mw.before_agent({"messages": []}) is None
+    assert mw.before_agent({"messages": _tool_pair()}) is None
+
+
+def test_patch_tool_calls_inserts_missing_and_malformed_results_in_order():
+    messages = [
+        _msg(0, "start"),
+        {"id": "a1", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "answered", "name": "search", "input": {}},
+            {"type": "tool_use", "id": "missing", "name": "write_file", "input": {}},
+            {"type": "invalid_tool_call", "id": "broken", "name": None,
+             "args": "{truncated"},
+            {"type": "tool_use", "id": None, "name": "no_id", "input": {}},
+        ]},
+        {"id": "t1", "role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "answered", "content": "ok"},
+        ]},
+        {"id": "a2", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "later", "name": "delete", "input": {}},
+        ]},
+        _msg(4, "continue"),
+    ]
+    original = deepcopy(messages)
+
+    update = PatchToolCallsMiddleware().before_agent({"messages": messages})
+
+    assert messages == original                    # 不原地改写调用方历史
+    assert update["messages"][0] == {
+        "id": REMOVE_ALL_MESSAGES, "role": "remove", "content": ""}
+    patched = update["messages"][1:]
+    assert [message["id"] for message in patched] == [
+        "m0", "a1", "patch-tool-calls-1", "t1",
+        "a2", "patch-tool-calls-3", "m4",
+    ]
+
+    first_results = patched[2]["content"]
+    assert [block["tool_use_id"] for block in first_results] == ["missing", "broken"]
+    assert "did not complete" in first_results[0]["content"]
+    assert "cancelled or interrupted" in first_results[0]["content"]
+    assert "Tool call unknown with id broken" in first_results[1]["content"]
+    assert "malformed or truncated" in first_results[1]["content"]
+    assert all(block["is_error"] for block in first_results)
+    assert patched[5]["content"][0]["tool_use_id"] == "later"
+
+    # 补丁本身也是已有结果；再次启动不会重复修复。
+    assert PatchToolCallsMiddleware().before_agent({"messages": patched}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +552,36 @@ class FakeModel:
                    for message in request.messages)
         self.requests.append(request)
         return self.responses.pop(0)
+
+
+def test_deep_agent_patches_dangling_history_before_model_and_checkpoint_replay():
+    model = FakeModel([[{"type": "text", "text": "recovered"}]])
+    app = create_deep_agent(model, checkpointer=InMemorySaver())
+    cfg = {"thread_id": "patch-tool-calls"}
+    out = app.invoke({"messages": [
+        _msg(0, "start"),
+        {"id": "a1", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "lost", "name": "search", "input": {"q": "x"}},
+        ]},
+        _msg(2, "continue without executing the old call"),
+    ]}, config=cfg)
+
+    assert [message["id"] for message in out["messages"]] == [
+        "m0", "a1", "patch-tool-calls-1", "m2", out["messages"][-1]["id"]]
+    patch = out["messages"][2]
+    assert patch["role"] == "user"
+    assert patch["content"][0]["tool_use_id"] == "lost"
+    assert "did not complete" in patch["content"][0]["content"]
+    # 模型实际收到 assistant -> 补充 tool_result -> 新 user 消息的顺序。
+    assert [message["role"] for message in model.requests[0].messages[:4]] == [
+        "user", "assistant", "user", "user"]
+    assert model.requests[0].messages[2]["content"][0]["tool_use_id"] == "lost"
+
+    # get_state 会从 DeltaChannel 增量重放，验证 remove-all/rebuild 可持久恢复。
+    restored = app.get_state(cfg).values["messages"]
+    assert [message["id"] for message in restored] == [
+        message["id"] for message in out["messages"]]
+    assert restored[2] == patch
 
 
 def test_deep_agent_read_file_discloses_skill_from_backend():
