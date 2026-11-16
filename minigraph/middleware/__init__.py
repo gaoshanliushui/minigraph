@@ -1,7 +1,7 @@
 """
 内置中间件（对齐 LangChain v1 的 langchain/agents/middleware）。
 
-六个：
+通用中间件：
 
     human_in_the_loop   工具调用要人批准才执行
     model_call_limit    限制模型调用次数
@@ -9,6 +9,11 @@
     model_retry         模型调用失败自动重试
     tool_call_limit     限制工具调用次数
     tool_retry          工具调用失败自动重试
+
+Deep agents 中间件：
+
+    skills              技能元数据发现、提示注入和按需全文披露
+    summarization       上下文摘要，原始历史保留并转存到 backend
 
 用：
 
@@ -62,6 +67,25 @@ from .model_call_limit import (
 )
 from .model_fallback import ModelFallbackMiddleware
 from .model_retry import ModelRetryMiddleware
+from .skills import (
+    SKILLS_SYSTEM_PROMPT,
+    SkillMetadata,
+    SkillSource,
+    SkillsMiddleware,
+    SkillsState,
+)
+from .summarization import (
+    DEFAULT_SUMMARY_PROMPT,
+    SUMMARIZATION_EVENT_KEY,
+    SUMMARIZATION_SESSION_ID_KEY,
+    SummarizationEvent,
+    SummarizationMiddleware,
+    SummarizationState,
+    TriggerClause,
+    compute_summarization_defaults,
+    count_tokens_approximately,
+    create_summarization_middleware,
+)
 from .tool_call_limit import (
     ToolCallLimitExceededError,
     ToolCallLimitMiddleware,
@@ -112,4 +136,20 @@ __all__ = [
     "ToolCallLimitState",
     "ToolCallLimitExceededError",
     "ToolRetryMiddleware",
+    # Deep agents
+    "SkillsMiddleware",
+    "SkillsState",
+    "SkillMetadata",
+    "SkillSource",
+    "SKILLS_SYSTEM_PROMPT",
+    "SummarizationMiddleware",
+    "SummarizationState",
+    "SummarizationEvent",
+    "TriggerClause",
+    "SUMMARIZATION_EVENT_KEY",
+    "SUMMARIZATION_SESSION_ID_KEY",
+    "DEFAULT_SUMMARY_PROMPT",
+    "count_tokens_approximately",
+    "compute_summarization_defaults",
+    "create_summarization_middleware",
 ]

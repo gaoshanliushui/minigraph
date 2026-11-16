@@ -57,13 +57,14 @@ from dotenv import load_dotenv
 
 from minigraph.builder import StateGraph
 from minigraph.checkpoint_sqlite import SqliteSaver
-from minigraph.constants import END, START
+from minigraph.constants import END
 from minigraph.middleware import (
     MiddlewareStack,
     ModelRequest,
     ToolRequest,
-    add_hook_nodes,
+    agent_state_schema,
     middleware,
+    wire_middleware_graph,
     wrap_model_call,
     wrap_tool_call,
 )
@@ -230,10 +231,11 @@ def _chat_once(request: ModelRequest) -> list[dict]:
     return [block.model_dump() for block in resp.content]
 
 
-def chat(messages: list[dict], tools: list[dict], *, max_tokens: int = 1024) -> list[dict]:
+def chat(messages: list[dict], tools: list[dict], *, max_tokens: int = 1024,
+         state: dict | None = None) -> list[dict]:
     """一次带中间件链的模型调用：日志 -> 重试 -> 真实请求，返回 content blocks。"""
     req = ModelRequest(model=_get_llm().model, messages=list(messages),
-                       tools=list(tools), max_tokens=max_tokens)
+                       tools=list(tools), max_tokens=max_tokens, state=state)
     return STACK.model_call(req, _chat_once)
 
 
@@ -281,9 +283,10 @@ def call_model(state: AgentState) -> dict:
     （见 build()），执行时机由图拓扑表达。
     """
     api_messages = [
-        {k: v for k, v in m.items() if k != "id"} for m in state["messages"]
+        {k: v for k, v in m.items() if k not in {"id", "additional_kwargs"}}
+        for m in state["messages"]
     ]
-    content = chat(api_messages, TOOL_SCHEMAS)
+    content = chat(api_messages, TOOL_SCHEMAS, state=state)
     return {"messages": [{
         "id": _new_id("ai"),
         "role": "assistant",
@@ -304,7 +307,7 @@ def tool_node(state: AgentState) -> dict:
     results = []
     for c in calls:
         # 工具执行也走中间件链：日志 + 异常兜底（tool_guard）
-        out = STACK.tool_call(ToolRequest(c), _run_tool)
+        out = STACK.tool_call(ToolRequest(c, state=state), _run_tool)
         results.append({
             "type": "tool_result",
             "tool_use_id": c["id"],
@@ -327,15 +330,6 @@ def should_continue(state: AgentState) -> str:
 
 
 # ---------------------------------------------------------------- 构图
-def _chain(g, src: str, names: list[str]) -> str:
-    """src -> n1 -> n2 -> ...，返回链尾（names 为空时返回 src）。"""
-    prev = src
-    for n in names:
-        g.add_edge(prev, n)
-        prev = n
-    return prev
-
-
 def build(checkpointer=None):
     """
     对齐 LangChain create_agent（agents/factory.py）的接线：
@@ -346,23 +340,10 @@ def build(checkpointer=None):
         agent -> LogCalls.after_model -> 条件路由
         路由的 END 分支 -> LogCalls.after_agent -> END   （只跑一次）
     """
-    g = StateGraph(AgentState)
+    g = StateGraph(agent_state_schema(AgentState, STACK))
     g.add_node("model", call_model)
     g.add_node("tools", tool_node)
-    hooks = add_hook_nodes(g, STACK)     # 状态钩子中间件 -> 节点
-
-    # 入口：START -> before_agent* -> before_model* -> agent
-    g.add_edge(_chain(g, START, hooks["before_agent"] + hooks["before_model"]), "model")
-    # 回环：tools -> before_model* -> agent（每轮 ReAct 都过 before_model）
-    g.add_edge(_chain(g, "tools", hooks["before_model"]), "model")
-    # 出口：agent -> after_model*（逆序）-> 条件路由
-    route_from = _chain(g, "model", hooks["after_model"])
-    # 路由的 END 分支先过 after_agent*（逆序），再到 END
-    exits = hooks["after_agent"]
-    if exits:
-        g.add_edge(_chain(g, exits[0], exits[1:]), END)
-    g.add_conditional_edges(route_from, should_continue,
-                            {"tools": "tools", END: exits[0] if exits else END})
+    wire_middleware_graph(g, STACK, route=should_continue)
     return g.compile(checkpointer=checkpointer)
 
 

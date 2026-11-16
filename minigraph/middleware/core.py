@@ -129,6 +129,7 @@ class ModelRequest:
     tools: list[dict] = field(default_factory=list)
     max_tokens: int = 1024
     system: str | None = None          # Messages API 的顶层 system 参数
+    state: dict | None = None          # 当时的 agent state（可选，供状态感知中间件读取）
 
 
 @dataclass

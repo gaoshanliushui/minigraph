@@ -31,8 +31,9 @@
             派一个独立子代理跑完整 ReAct 回环（独立消息历史），
             主对话只拿到它的最终结论
 
-与真实 deepagents 的差异（刻意精简）：无 skills/memory/response_format/
-summarization；无 execute（shell 需要沙箱后端）；文件系统是 state 内的
+Skills / Summarization 可通过 ``middleware=[...]`` 注入，对应 state schema
+会自动并入本图；二者默认不启用。与真实 deepagents 仍有差异：无 memory/
+response_format；无 execute（shell 需要沙箱后端）；文件系统是 state 内的
 虚拟实现而非可插拔 backend；子代理不支持 async/远程、不可再嵌套 task。
 
 模型/工具调用默认带一个最内层的异常兜底中间件（工具异常 -> 错误文本），
@@ -46,12 +47,13 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Callable
 
 from .builder import StateGraph
-from .constants import END, START
+from .constants import END
 from .middleware import (
     MiddlewareStack,
     ModelRequest,
     ToolRequest,
-    add_hook_nodes,
+    agent_state_schema,
+    wire_middleware_graph,
     wrap_tool_call,
 )
 from .state import DeltaChannel, State, add_messages, merge_dict
@@ -175,15 +177,6 @@ def _tool_guard(request, handler):
         return f"工具执行失败: {e}"
 
 
-def _chain(g, src: str, names: list[str]) -> str:
-    """src -> n1 -> n2 -> ...，返回链尾（names 为空时返回 src）。"""
-    prev = src
-    for n in names:
-        g.add_edge(prev, n)
-        prev = n
-    return prev
-
-
 # ---------------------------------------------------------------------------
 # 组装
 # ---------------------------------------------------------------------------
@@ -223,11 +216,13 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
 
     def call_model(state: DeepAgentState) -> dict:
         api_messages = [
-            {k: v for k, v in m.items() if k != "id"} for m in state["messages"]
+            {k: v for k, v in m.items()
+             if k not in {"id", "additional_kwargs"}}
+            for m in state["messages"]
         ]
         req = ModelRequest(model="", messages=api_messages,
                            tools=[t.schema() for t in registry.values()],
-                           system=prompt)
+                           system=prompt, state=state)
         content = stack.model_call(req, model)
         return {"messages": [{"id": _mid("ai"), "role": "assistant",
                               "content": content}]}
@@ -252,7 +247,7 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
                     return text
                 return str(_t.invoke(request.args))
 
-            out = stack.tool_call(ToolRequest(c), _exec)
+            out = stack.tool_call(ToolRequest(c, state=state), _exec)
             results.append({"type": "tool_result", "tool_use_id": c["id"],
                             "content": out})
         return {**extra, "messages": [{"id": _mid("tool"), "role": "user",
@@ -264,19 +259,11 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
             b.get("type") == "tool_use" for b in last["content"])
         return "tools" if has_call else END
 
-    # create_agent 拓扑：状态钩子中间件各自成节点（与 examples/03 一致）
-    g = StateGraph(DeepAgentState)
+    # 统一组装：合并中间件声明的 state 字段，并接入完整 create_agent 拓扑。
+    g = StateGraph(agent_state_schema(DeepAgentState, stack))
     g.add_node("model", call_model)
     g.add_node("tools", tool_node)
-    hooks = add_hook_nodes(g, stack)
-    g.add_edge(_chain(g, START, hooks["before_agent"] + hooks["before_model"]), "model")
-    g.add_edge(_chain(g, "tools", hooks["before_model"]), "model")
-    route_from = _chain(g, "model", hooks["after_model"])
-    exits = hooks["after_agent"]
-    if exits:
-        g.add_edge(_chain(g, exits[0], exits[1:]), END)
-    g.add_conditional_edges(route_from, should_continue,
-                            {"tools": "tools", END: exits[0] if exits else END})
+    wire_middleware_graph(g, stack, route=should_continue)
     return g.compile(checkpointer=checkpointer)
 
 
