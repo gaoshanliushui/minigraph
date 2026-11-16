@@ -2,7 +2,7 @@
 示例 4：create_deep_agent —— 模仿 deepagents 的深度代理
 
 在示例 3 的同一张 ReAct 回环上，用工厂方法一键组装出带**规划、真实文件
-backend、子代理和自动摘要**能力的深度代理（minigraph/deep_agent.py）：
+backend、子代理和自动摘要**能力的深度代理（deep_agent/deep_agent.py）：
 
     backend = FilesystemBackend(_ROOT / ".deep_agent_workspace")
     app = create_deep_agent(llm, tools=[get_weather], backend=backend,
@@ -34,10 +34,10 @@ import json
 import sys
 from pathlib import Path
 
-from minigraph.backends import FilesystemBackend
+from deep_agent import create_deep_agent
+from deep_agent.backends import FilesystemBackend
+from deep_agent.middleware import ModelRequest
 from minigraph.checkpoint_sqlite import SqliteSaver
-from minigraph.deep_agent import create_deep_agent
-from minigraph.middleware import ModelRequest
 from minigraph.tools import tool
 
 _ROOT = Path(__file__).resolve().parent.parent

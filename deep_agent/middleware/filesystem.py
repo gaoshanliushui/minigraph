@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from ..tools import Tool, tool
+from minigraph.tools import Tool, tool
 from .core import Middleware, ModelRequest
 
 FILESYSTEM_SYSTEM_PROMPT = """## Filesystem

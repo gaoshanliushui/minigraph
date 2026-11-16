@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..context import GraphInterrupt
+from minigraph.context import GraphInterrupt
 from .core import Middleware, ModelRequest
 from ._retry import (
     OnFailure,

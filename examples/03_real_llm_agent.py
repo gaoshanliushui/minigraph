@@ -31,7 +31,7 @@ anthropic SDK 就够，不需要为每家写转换层。端点/模型名如有�
 
 工具用 **@tool** 声明（minigraph/tools.py）：从函数签名 + docstring
 自动生成给模型看的 JSON Schema，不再手写 TOOL_SCHEMAS。
-模型调用和工具调用都走**中间件链**（minigraph/middleware.py）：
+模型调用和工具调用都走**中间件链**（deep_agent/middleware/）：
 
     LogCalls（@middleware 类式，日志）
       └─ retry_model（@wrap_model_call，失败重试）   -> 真实模型调用
@@ -58,7 +58,7 @@ from dotenv import load_dotenv
 from minigraph.builder import StateGraph
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.constants import END
-from minigraph.middleware import (
+from deep_agent.middleware import (
     MiddlewareStack,
     ModelRequest,
     ToolRequest,

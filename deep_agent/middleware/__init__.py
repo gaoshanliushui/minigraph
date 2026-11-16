@@ -19,7 +19,7 @@ Deep agents 中间件：
 
 用：
 
-    from minigraph.middleware import ModelRetryMiddleware, ToolCallLimitMiddleware
+    from deep_agent.middleware import ModelRetryMiddleware, ToolCallLimitMiddleware
 
     app = create_agent(model, tools=[...], middleware=[
         ModelRetryMiddleware(max_retries=3),

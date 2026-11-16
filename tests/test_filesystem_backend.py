@@ -7,15 +7,15 @@ import base64
 
 import pytest
 
-from minigraph.backends import (
+from deep_agent.backends import (
     FILE_NOT_FOUND,
     INVALID_PATH,
     IS_DIRECTORY,
     FilesystemBackend,
     ReadResult,
 )
-from minigraph.backends.utils import EMPTY_CONTENT_WARNING
-from minigraph.middleware import ModelRequest, SkillsMiddleware, SummarizationMiddleware
+from deep_agent.backends.utils import EMPTY_CONTENT_WARNING
+from deep_agent.middleware import ModelRequest, SkillsMiddleware, SummarizationMiddleware
 
 
 @pytest.fixture
@@ -263,7 +263,7 @@ def test_grep_skips_binary_and_oversized_files(backend, root):
 
 
 def test_search_time_budget_returns_partial_results(backend, root, monkeypatch):
-    import minigraph.backends.filesystem as filesystem_module
+    import deep_agent.backends.filesystem as filesystem_module
 
     _make_search_tree(root)
     monotonic = iter(range(0, 100, 2))

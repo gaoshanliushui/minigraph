@@ -9,7 +9,7 @@ from minigraph.builder import StateGraph
 from minigraph.checkpoint import InMemorySaver
 from minigraph.constants import END, START
 from minigraph.context import GraphInterrupt
-from minigraph.middleware import (
+from deep_agent.middleware import (
     HumanInTheLoopMiddleware,
     MiddlewareStack,
     ModelCallLimitExceededError,
@@ -252,7 +252,7 @@ def test_model_retry_does_not_retry_interrupts():
 
 
 def test_model_retry_backoff_is_capped():
-    from minigraph.middleware._retry import calculate_delay
+    from deep_agent.middleware._retry import calculate_delay
     d = calculate_delay(10, backoff_factor=2.0, initial_delay=1.0,
                         max_delay=8.0, jitter=False)
     assert d == 8.0

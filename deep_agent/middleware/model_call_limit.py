@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from .core import Middleware, hook_config
-from ..state import State
+from minigraph.state import State
 
 __all__ = [
     "ModelCallLimitState",

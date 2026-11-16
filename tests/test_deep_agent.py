@@ -6,11 +6,11 @@ SDK、不需要 API key，但走的是完整的图回环与 state 更新。
 
 import pytest
 
-from minigraph.backends import FilesystemBackend
+from deep_agent import create_deep_agent
+from deep_agent.backends import FilesystemBackend
+from deep_agent.middleware import middleware
 from minigraph.checkpoint import InMemorySaver
 from minigraph.checkpoint_sqlite import SqliteSaver
-from minigraph.deep_agent import create_deep_agent
-from minigraph.middleware import middleware
 
 
 def _text(s):

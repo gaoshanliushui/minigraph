@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from ..context import GraphInterrupt
+from minigraph.context import GraphInterrupt
 from .core import Middleware, ToolRequest
 from ._retry import (
     OnFailure,

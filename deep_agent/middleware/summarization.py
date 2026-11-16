@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from .core import Middleware, ModelRequest
-from ..state import State
+from minigraph.state import State
 
 logger = logging.getLogger(__name__)
 

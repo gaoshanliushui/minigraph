@@ -19,4 +19,4 @@ llm = ["anthropic>=0.40", "python-dotenv>=1.0"]
 dev = ["pytest>=8"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["minigraph"]
+packages = ["minigraph", "deep_agent"]

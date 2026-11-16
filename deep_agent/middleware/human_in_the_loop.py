@@ -36,9 +36,10 @@ from __future__ import annotations
 import json
 from typing import Any, Literal, TypedDict
 
-from ..context import interrupt
+from minigraph.context import interrupt
+from minigraph.state import State
+
 from .core import Middleware, ToolRequest, hook_config
-from ..state import State
 
 __all__ = [
     "HumanInTheLoopMiddleware",

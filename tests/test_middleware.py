@@ -2,7 +2,7 @@
 
 import pytest
 
-from minigraph.middleware import (
+from deep_agent.middleware import (
     MiddlewareStack,
     ModelRequest,
     ToolRequest,

@@ -34,7 +34,7 @@ from pathlib import PurePosixPath
 from typing import Any, TypedDict
 
 from .core import Middleware, ModelRequest, ToolRequest
-from ..state import State
+from minigraph.state import State
 
 logger = logging.getLogger(__name__)
 

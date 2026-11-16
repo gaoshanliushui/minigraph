@@ -11,8 +11,8 @@ from copy import deepcopy
 import pytest
 
 from minigraph.checkpoint import InMemorySaver
-from minigraph.deep_agent import create_deep_agent
-from minigraph.middleware import (
+from deep_agent import create_deep_agent
+from deep_agent.middleware import (
     ModelRequest,
     PatchToolCallsMiddleware,
     SkillsMiddleware,

@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from ..state import REMOVE_ALL_MESSAGES
+from minigraph.state import REMOVE_ALL_MESSAGES
 from .core import Middleware
 
 _TOOL_CALL_TYPES = {"tool_use", "invalid_tool_call"}

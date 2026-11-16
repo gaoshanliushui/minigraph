@@ -86,8 +86,8 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Callable, Literal
 
-from ..channels import EphemeralValue
-from ..constants import END, LAST_VALUE, START
+from minigraph.channels import EphemeralValue
+from minigraph.constants import END, LAST_VALUE, START
 
 Handler = Callable[[Any], Any]
 
@@ -786,7 +786,7 @@ def merge_state_schemas(base, extra_schemas, *, need_jump_to: bool = False):
     "节点写了未声明的字段 jump_to"。让组装阶段自动补上，
     使用者就不用记这件事了。
     """
-    from ..state import _schema, _schema_channels, _schema_types
+    from minigraph.state import _schema, _schema_channels, _schema_types
 
     merged: dict[str, Any] = dict(_schema(base))
     merged_types = dict(_schema_types(base))
@@ -816,7 +816,7 @@ def merge_state_schemas(base, extra_schemas, *, need_jump_to: bool = False):
 def _make_merged_state(reducers: dict[str, Any], types: dict[str, Any],
                        channels: dict[str, Any]):
     """造一个 State 子类，装着合并后的字段。"""
-    from ..state import State
+    from minigraph.state import State
 
     ann: dict[str, Any] = {}
     for field, reducer in reducers.items():

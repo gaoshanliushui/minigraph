@@ -50,8 +50,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any, Callable
 
-from .builder import StateGraph
-from .constants import END
+from minigraph.builder import StateGraph
+from minigraph.constants import END
+from minigraph.state import DeltaChannel, State, add_messages, merge_dict
+from minigraph.tools import Tool, tool
+
 from .middleware import (
     FilesystemMiddleware,
     HumanInTheLoopMiddleware,
@@ -66,8 +69,6 @@ from .middleware import (
     wire_middleware_graph,
     wrap_tool_call,
 )
-from .state import DeltaChannel, State, add_messages, merge_dict
-from .tools import Tool, tool
 
 BASE_PROMPT = """\
 你是一个深度代理（deep agent），擅长把复杂的多步骤任务拆解并推进到底。

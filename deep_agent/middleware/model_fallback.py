@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ..context import GraphInterrupt
+from minigraph.context import GraphInterrupt
 from .core import Middleware, ModelRequest
 
 __all__ = ["ModelFallbackMiddleware"]
