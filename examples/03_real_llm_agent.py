@@ -62,6 +62,7 @@ from minigraph.middleware import (
     MiddlewareStack,
     ModelRequest,
     ToolRequest,
+    add_hook_nodes,
     middleware,
     wrap_model_call,
     wrap_tool_call,
@@ -169,6 +170,9 @@ class LogCalls:
     def before_model(self, state):
         print(f"    [mw] before_model：当前历史 {len(state.get('messages', []))} 条")
 
+    def after_model(self, state):
+        print(f"    [mw] after_model：模型已返回，历史 {len(state.get('messages', []))} 条")
+
     def wrap_model_call(self, request, handler):
         print(f"    [mw] model -> {request.model}（{len(request.messages)} 条消息）")
         result = handler(request)
@@ -269,19 +273,20 @@ def _new_id(prefix: str) -> str:
 
 # ---------------------------------------------------------------- 节点
 def call_model(state: AgentState) -> dict:
-    """真 LLM：before_model -> 调模型（around 链）-> after_model。"""
-    # 状态钩子返回的是 state 更新（本例只打印，返回 None），合并进节点返回值
-    pre = STACK.before_model(state)
+    """真 LLM：把历史原样发给 API（只剥掉消息级 id），存回 assistant 消息。
+
+    before_model/after_model 不在函数体里调用 —— 它们是**独立的图节点**
+    （见 build()），执行时机由图拓扑表达。
+    """
     api_messages = [
         {k: v for k, v in m.items() if k != "id"} for m in state["messages"]
     ]
     content = chat(api_messages, TOOL_SCHEMAS)
-    post = STACK.after_model(state)
-    return {**pre, "messages": [{
+    return {"messages": [{
         "id": _new_id("ai"),
         "role": "assistant",
         "content": content,               # block 列表：text / tool_use ...
-    }], **post}
+    }]}
 
 
 def tool_node(state: AgentState) -> dict:
@@ -320,13 +325,42 @@ def should_continue(state: AgentState) -> str:
 
 
 # ---------------------------------------------------------------- 构图
+def _chain(g, src: str, names: list[str]) -> str:
+    """src -> n1 -> n2 -> ...，返回链尾（names 为空时返回 src）。"""
+    prev = src
+    for n in names:
+        g.add_edge(prev, n)
+        prev = n
+    return prev
+
+
 def build(checkpointer=None):
+    """
+    对齐 LangChain create_agent（agents/factory.py）的接线：
+    实现了状态钩子的中间件**各自生成一个节点**，执行时机由图拓扑表达：
+
+        START -> LogCalls.before_agent -> LogCalls.before_model -> agent
+        tools -> LogCalls.before_model -> agent          （回环也过 before_model）
+        agent -> LogCalls.after_model -> 条件路由
+        路由的 END 分支 -> LogCalls.after_agent -> END   （只跑一次）
+    """
     g = StateGraph(AgentState)
-    g.add_node("agent", call_model)
+    g.add_node("model", call_model)
     g.add_node("tools", tool_node)
-    g.add_edge(START, "agent")
-    g.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
-    g.add_edge("tools", "agent")
+    hooks = add_hook_nodes(g, STACK)     # 状态钩子中间件 -> 节点
+
+    # 入口：START -> before_agent* -> before_model* -> agent
+    g.add_edge(_chain(g, START, hooks["before_agent"] + hooks["before_model"]), "model")
+    # 回环：tools -> before_model* -> agent（每轮 ReAct 都过 before_model）
+    g.add_edge(_chain(g, "tools", hooks["before_model"]), "model")
+    # 出口：agent -> after_model*（逆序）-> 条件路由
+    route_from = _chain(g, "model", hooks["after_model"])
+    # 路由的 END 分支先过 after_agent*（逆序），再到 END
+    exits = hooks["after_agent"]
+    if exits:
+        g.add_edge(_chain(g, exits[0], exits[1:]), END)
+    g.add_conditional_edges(route_from, should_continue,
+                            {"tools": "tools", END: exits[0] if exits else END})
     return g.compile(checkpointer=checkpointer)
 
 
@@ -362,13 +396,11 @@ if __name__ == "__main__":
     print(f"Q: {question}   (provider={llm.provider}, model={llm.model}, db={db.name})")
 
     user_input = {"messages": [{"id": _new_id("h"), "role": "user", "content": question}]}
-    STACK.before_agent(user_input)       # agent 级钩子：整个调用一次
 
     for node, step, update in app.stream(user_input, config=cfg):
         for m in update.get("messages", []):
             print(f"  step {step} | {node:<6} | {_brief(m)}")
 
     final = app.get_state(cfg).values["messages"]
-    STACK.after_agent({"messages": final})
     print(f"\n本 thread 共 {len(final)} 条消息；最后一条：")
     print(" ", _brief(final[-1]))

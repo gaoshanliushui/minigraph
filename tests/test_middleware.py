@@ -6,6 +6,7 @@ from minigraph.middleware import (
     MiddlewareStack,
     ModelRequest,
     ToolRequest,
+    add_hook_nodes,
     after_agent,
     after_model,
     before_agent,
@@ -252,3 +253,59 @@ def test_agent_hooks_and_state_hook_typo_detection():
         class Typo:
             def before_modell(self, state):          # 多个 l，应被拦下
                 ...
+
+
+# ---------------------------------------------------------------------------
+# 状态钩子 -> 图节点（add_hook_nodes，对齐 create_agent）
+# ---------------------------------------------------------------------------
+
+class _FakeGraph:
+    def __init__(self):
+        self.nodes = {}
+
+    def add_node(self, name, fn):
+        self.nodes[name] = fn
+
+
+def test_add_hook_nodes_names_and_execution_order():
+    @middleware
+    class A:
+        def before_model(self, state):
+            return {"a": 1}
+
+        def after_model(self, state):
+            return None
+
+    @middleware
+    class B:
+        def before_model(self, state):
+            return None
+
+        def after_model(self, state):
+            return None
+
+    g = _FakeGraph()
+    hooks = add_hook_nodes(g, MiddlewareStack([A, B]))
+    assert hooks["before_model"] == ["A.before_model", "B.before_model"]   # 正序
+    assert hooks["after_model"] == ["B.after_model", "A.after_model"]      # 逆序
+    assert hooks["before_agent"] == [] and hooks["after_agent"] == []
+    # 节点就是可执行函数：返回钩子给的更新；None -> {}
+    assert g.nodes["A.before_model"]({"x": 1}) == {"a": 1}
+    assert g.nodes["B.before_model"]({}) == {}
+
+
+def test_add_hook_nodes_skips_base_and_around_only():
+    @before_model
+    def bm(state):
+        return {"seen": True}
+
+    @wrap_model_call
+    def around(request, handler):
+        return handler(request)
+
+    g = _FakeGraph()
+    hooks = add_hook_nodes(g, MiddlewareStack([bm, around]))
+    # @before_model 只生成自己那个钩子节点；around-only 不生成状态节点
+    assert hooks["before_model"] == ["bm.before_model"]
+    assert all(not names for hook, names in hooks.items() if hook != "before_model")
+    assert len(g.nodes) == 1

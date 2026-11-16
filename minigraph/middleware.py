@@ -249,6 +249,61 @@ def middleware(target):
 
 
 # ---------------------------------------------------------------------------
+# 状态钩子 -> 图节点（对齐 LangChain create_agent 的 factory）
+# ---------------------------------------------------------------------------
+# LangChain（langchain/agents/factory.py）不是"在模型节点里手动调钩子"，
+# 而是给每个实现了状态钩子的中间件**生成一个图节点**：
+#   节点名   f"{middleware.name}.{hook}"（如 "LogCalls.before_model"）
+#   入口     START -> before_agent*(正序) -> before_model*(正序) -> model
+#   回环     tools -> before_model* -> model        （loop_entry）
+#   出口     model -> after_model*(逆序) -> 路由     （loop_exit 上挂条件边）
+#   结束     路由的 END 分支 -> after_agent*(逆序) -> END
+# before_agent/after_agent 每次 agent 调用只跑一次，before_model/after_model
+# 每轮 ReAct 都过 —— 这是它们和 around 钩子的本质区别，也是"为什么应该是
+# 节点"：执行时机由**图拓扑**表达，而不是藏在某个节点的函数体里。
+
+def _mw_name(mw) -> str:
+    return getattr(mw, "name", None) or type(mw).__name__
+
+
+def _implements(mw, hook: str) -> bool:
+    """该中间件是否**真的实现了**这个状态钩子（而不是基类默认直通）。"""
+    if isinstance(mw, _StateFuncMiddleware):
+        return mw.hook == hook          # @before_model 这类只实现自己那一个
+    fn = getattr(type(mw), hook, None)
+    return fn is not None and fn is not getattr(Middleware, hook)
+
+
+def add_hook_nodes(g, stack: "MiddlewareStack") -> dict[str, list[str]]:
+    """
+    把 stack 里实现了状态钩子的中间件各注册成一个图节点。
+
+    返回 {hook: [节点名, ...]}，列表按**执行顺序**排列：
+    before_* 正序、after_* 逆序（after 与 wrap 链的洋葱出口一致）。
+    接线（入口/回环/出口/END 分支）由调用方按 create_agent 的拓扑完成
+    （见 examples/03 的 build()），本函数只负责"哪些节点、什么顺序"。
+    """
+    result: dict[str, list[str]] = {}
+    for hook in _STATE_HOOKS:
+        mws = [mw for mw in stack.middlewares if _implements(mw, hook)]
+        if hook.startswith("after_"):
+            mws.reverse()
+        names = []
+        for mw in mws:
+            name = f"{_mw_name(mw)}.{hook}"
+            fn = getattr(mw, hook)
+
+            def node(state, _fn=fn):
+                return _fn(state) or {}   # None = 无状态更新
+
+            node.__name__ = name
+            g.add_node(name, node)
+            names.append(name)
+        result[hook] = names
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 执行：把中间件链套到真实调用 / agent 节点上
 # ---------------------------------------------------------------------------
 

@@ -167,6 +167,20 @@ def test_react_loop_with_fake_client():
     assert second[-1]["content"][0]["tool_use_id"] == "toolu_1"
 
 
+def test_hook_nodes_run_at_graph_positions(capsys):
+    """状态钩子是独立图节点：agent 级各跑一次，model 级每轮各跑一次。"""
+    llm = _fake_llm(_TWO_ROUNDS)
+    with patch.object(ex03, "_get_llm", return_value=llm):
+        app = ex03.build(InMemorySaver())
+        app.invoke(dict(_INPUT), config={"thread_id": "t"})
+
+    out = capsys.readouterr().out
+    assert out.count("===== agent 开始") == 1        # before_agent 节点
+    assert out.count("===== agent 结束") == 1        # after_agent 节点（END 分支）
+    assert out.count("before_model：") == 2          # 两轮模型调用，各过一次
+    assert out.count("after_model：") == 2
+
+
 def test_sdk_blocks_survive_sqlite_checkpoint(tmp_path):
     """SDK 的 pydantic block 转 dict 后才能落 JSON checkpoint —— 验证这条路。"""
     llm = _fake_llm(_TWO_ROUNDS)
