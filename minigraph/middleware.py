@@ -99,12 +99,13 @@ _HOOKS = _WRAP_HOOKS + _STATE_HOOKS
 
 @dataclass
 class ModelRequest:
-    """一次模型调用的全部入参。中间件可整体替换 model/messages/tools。"""
+    """一次模型调用的全部入参。中间件可整体替换 model/messages/tools/system。"""
 
     model: str
     messages: list[dict]
     tools: list[dict] = field(default_factory=list)
     max_tokens: int = 1024
+    system: str | None = None          # Messages API 的顶层 system 参数
 
 
 @dataclass

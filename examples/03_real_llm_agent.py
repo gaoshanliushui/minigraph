@@ -217,11 +217,13 @@ STACK = MiddlewareStack([LogCalls, retry_model, tool_guard])
 # ---------------------------------------------------------------- LLM 调用
 def _chat_once(request: ModelRequest) -> list[dict]:
     """真正发 HTTP 的一层（中间件链的最内层 handler）。"""
+    kwargs = {"system": request.system} if request.system else {}
     resp = _get_llm().client.messages.create(
         model=request.model,
         max_tokens=request.max_tokens,
         messages=request.messages,
         tools=request.tools,
+        **kwargs,
     )
     # block 对象 model_dump() 成 dict：checkpoint 走 JSON 序列化（存不了
     # pydantic 对象），下一轮回传 API 和 add_messages 合并也都用 dict。

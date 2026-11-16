@@ -449,6 +449,9 @@ harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。
 7. `cp .env.example .env` 填 key，选 `LLM_PROVIDER`（anthropic / minimax / 火山引擎·方舟），
    跑 `uv run --extra llm python examples/03_real_llm_agent.py`，看同一张图换成真模型驱动
    （官方 anthropic SDK + python-dotenv，minigraph 内核仍零依赖）。
+8. 跑 `uv run --extra llm python examples/04_deep_agent.py`：`create_deep_agent`
+   （模仿 deepagents）一键组出带规划（write_todos）、虚拟文件系统、子代理（task）
+   的深度代理，复用同一份 .env 配置。
 
 ### 配套文档
 
