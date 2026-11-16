@@ -26,7 +26,9 @@
   规划      write_todos(todos)              待办清单，全量替换，存 state["todos"]
   文件系统  默认是 state["files"] 里的虚拟文件工具，可随 checkpoint 持久化；
             传 backend=FilesystemBackend(...) 后由 FilesystemMiddleware 提供
-            ls/read_file/write_file/edit_file/glob/grep/delete，读写真实 backend
+            ls/read_file/write_file/edit_file/glob/grep/delete，读写真实 backend。
+            大输入和大工具结果会被裁剪：超限的全文转存到 backend，
+            模型看到头尾预览 + 文件路径（可以再 read_file 读回来）
   子代理    task(description, subagent_type="general-purpose", prompt=None)
             由 SubAgentMiddleware 提供，派一个独立子代理跑完整 ReAct 回环
             （独立消息历史），主对话只拿到最终结论；子代理继承同一个 backend。
@@ -223,11 +225,18 @@ def _merge_middleware(base: list, custom, tail: list) -> list:
 def _build_agent(model, registry: dict[str, Tool], prompt: str,
                  middleware=(), checkpointer=None, *, backend=None,
                  skills=None, summarization: bool = True, interrupt_on=None,
-                 subagent_middleware: SubAgentMiddleware | None = None):
+                 subagent_middleware: SubAgentMiddleware | None = None,
+                 tool_token_limit_before_evict: int | None = 20000,
+                 human_message_token_limit_before_evict: int | None = 50000):
     registry = dict(registry)
     base_middleware = []
     if backend is not None:
-        base_middleware.append(FilesystemMiddleware(backend=backend))
+        base_middleware.append(FilesystemMiddleware(
+            backend=backend,
+            tool_token_limit_before_evict=tool_token_limit_before_evict,
+            human_message_token_limit_before_evict=(
+                human_message_token_limit_before_evict),
+        ))
     if subagent_middleware is not None:
         base_middleware.append(subagent_middleware)
     if summarization:
@@ -317,7 +326,9 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
                       backend=None,
                       interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
                       skills: list[str] | None = None,
-                      summarization: bool = True):
+                      summarization: bool = True,
+                      tool_token_limit_before_evict: int | None = 20000,
+                      human_message_token_limit_before_evict: int | None = 50000):
     """组装一个深度代理（签名与语义对照 deepagents.create_deep_agent）。
 
     参数含义见模块 docstring。返回编译好的图，直接 invoke/stream 即可：
@@ -337,6 +348,12 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
     清单，再用 ``config={"thread_id": ..., "resume": {"decisions": [...]}}``
     恢复。每项决定支持 approve/edit/reject/respond，具体允许哪些由工具配置
     决定。当前该配置只作用于主代理，不会由 task 子代理继承。
+
+    ``tool_token_limit_before_evict`` / ``human_message_token_limit_before_evict``
+    是**裁剪**阈值（单位 token，只在传了 backend 时生效）：超过阈值的工具
+    结果 / 用户消息会把全文转存到 backend（``/large_tool_results/``、
+    ``/conversation_history/``），模型看到的是头尾预览 + 文件路径 ——
+    模型可以再 ``read_file`` 把全文读回来。设成 None 关闭该行为。
     """
     extra_tools = [
         item if isinstance(item, Tool) else tool(item) for item in tools or []]
@@ -380,4 +397,7 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
     return _build_agent(model, registry, prompt, middleware,
                         checkpointer, backend=backend, skills=skills,
                         summarization=summarization, interrupt_on=interrupt_on,
-                        subagent_middleware=subagent_middleware)
+                        subagent_middleware=subagent_middleware,
+                        tool_token_limit_before_evict=tool_token_limit_before_evict,
+                        human_message_token_limit_before_evict=(
+                            human_message_token_limit_before_evict))

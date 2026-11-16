@@ -12,7 +12,8 @@
 
 Deep agents 中间件：
 
-    filesystem          把可插拔 backend 暴露为文件工具
+    filesystem          把可插拔 backend 暴露为文件工具，并对大输入/大工具
+                       结果做裁剪（超限的转存到 backend，模型看头尾预览）
     patch_tool_calls    为历史中的悬空 tool_use 补错误 tool_result
     skills              技能元数据发现、提示注入和按需全文披露
     subagents           通过 task 工具派发隔离子代理并回传最终结论
@@ -71,7 +72,13 @@ from .model_call_limit import (
 from .model_fallback import ModelFallbackMiddleware
 from .model_retry import ModelRetryMiddleware
 from .patch_tool_calls import PatchToolCallsMiddleware
-from .filesystem import FILESYSTEM_SYSTEM_PROMPT, FilesystemMiddleware
+from .filesystem import (
+    CONVERSATION_HISTORY_PREFIX,
+    FILESYSTEM_SYSTEM_PROMPT,
+    LARGE_TOOL_RESULTS_PREFIX,
+    TOOLS_EXCLUDED_FROM_EVICTION,
+    FilesystemMiddleware,
+)
 from .skills import (
     SKILLS_SYSTEM_PROMPT,
     SkillMetadata,
@@ -155,6 +162,9 @@ __all__ = [
     "PatchToolCallsMiddleware",
     "FilesystemMiddleware",
     "FILESYSTEM_SYSTEM_PROMPT",
+    "LARGE_TOOL_RESULTS_PREFIX",
+    "CONVERSATION_HISTORY_PREFIX",
+    "TOOLS_EXCLUDED_FROM_EVICTION",
     "SkillsMiddleware",
     "SkillsState",
     "SkillMetadata",
