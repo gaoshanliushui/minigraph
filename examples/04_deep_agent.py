@@ -16,8 +16,14 @@ backend、子代理和自动摘要**能力的深度代理（deep_agent/deep_agen
 
 运行（复用示例 3 的 .env 多 provider 配置）：
 
+    # 不传问题：进入连续对话；输入 exit / quit 或按 Ctrl-D 退出。
     uv run --extra llm python examples/04_deep_agent.py
+
+    # 传入问题：保持单次问答模式。
     uv run --extra llm python examples/04_deep_agent.py "把调研结果整理成报告写进 /report.md"
+
+连续对话始终使用同一个 thread_id。每轮只传入新的 user 消息，之前的问答由
+SqliteSaver 恢复，不需要手动把完整 messages 再传一遍。
 
 观察点：
   - stream 输出里能看到模型先 write_todos 拆任务，再逐步执行、更新清单；
@@ -32,6 +38,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import uuid
 from pathlib import Path
 
 from deep_agent import create_deep_agent
@@ -39,6 +46,7 @@ from deep_agent.backends import FilesystemBackend
 from deep_agent.middleware import ModelRequest
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.tools import tool
+from minigraph.utils import print_graph
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -72,6 +80,43 @@ def get_weather(city: str) -> str:
     return {"北京": "晴 18°C", "上海": "小雨 22°C"}.get(city, f"{city}：数据缺失")
 
 
+def run_turn(app, cfg: dict, question: str) -> dict:
+    """完成一轮问答；若发生 HITL 中断，审批后原地恢复本轮。"""
+    run_input = {"messages": [{
+        "id": f"human-{uuid.uuid4().hex[:12]}",
+        "role": "user",
+        "content": question,
+    }]}
+    run_cfg = cfg
+    while True:
+        for node, step, update in app.stream(run_input, config=run_cfg):
+            for message in update.get("messages", []):
+                print(f"  step {step} | {node:<28} | {ex03._brief(message)}")
+            if "todos" in update:
+                for todo in update["todos"]:
+                    print(f"           todo [{todo.get('status')}] "
+                          f"{todo.get('content')}")
+
+        pending = app.interrupted
+        if pending is None:
+            break
+        print("\n工具调用等待人工审批：")
+        print(json.dumps(pending, ensure_ascii=False, indent=2, default=str))
+        decisions = []
+        for action in pending["action_requests"]:
+            answer = input(
+                f"批准执行 {action['name']} {action['args']}？[y/N] "
+            ).strip().lower()
+            decisions.append(
+                {"type": "approve"} if answer in {"y", "yes"}
+                else {"type": "reject", "message": "用户未批准这次文件写入"})
+        # resume 只继续当前中断，不会开启新的用户轮次。
+        run_input = None
+        run_cfg = {**cfg, "resume": {"decisions": decisions}}
+
+    return app.get_state(cfg).values
+
+
 if __name__ == "__main__":
     try:
         info = ex03._get_llm()
@@ -88,38 +133,40 @@ if __name__ == "__main__":
             "allowed_decisions": ["approve", "reject"]}},
         checkpointer=SqliteSaver(str(_ROOT / "minigraph.db")),
     )
+
+    print_graph(app)
+
     cfg = {"thread_id": "deep-demo"}
-    question = sys.argv[1] if len(sys.argv) > 1 else \
-        "帮我规划北京两日游：先查天气，用 write_todos 拆任务，把每日安排写进 /plan.md，最后总结。"
-    print(f"Q: {question}   (provider={info.provider}, model={info.model})\n")
+    one_shot = sys.argv[1] if len(sys.argv) > 1 else None
+    print(f"provider={info.provider}, model={info.model}, thread={cfg['thread_id']}")
+    if one_shot is None:
+        print("连续对话模式：输入 exit / quit 或按 Ctrl-D 退出。")
 
-    run_input = {"messages": [{"role": "user", "content": question}]}
-    run_cfg = cfg
     while True:
-        for node, step, update in app.stream(run_input, config=run_cfg):
-            for m in update.get("messages", []):
-                print(f"  step {step} | {node:<28} | {ex03._brief(m)}")
-            if "todos" in update:
-                for t in update["todos"]:
-                    print(f"           todo [{t.get('status')}] {t.get('content')}")
-
-        pending = app.interrupted
-        if pending is None:
+        try:
+            if one_shot is not None:
+                question = one_shot
+                print(f"\n你> {question}")
+            else:
+                question = input("\n你> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见！")
             break
-        print("\n工具调用等待人工审批：")
-        print(json.dumps(pending, ensure_ascii=False, indent=2, default=str))
-        decisions = []
-        for action in pending["action_requests"]:
-            answer = input(
-                f"批准执行 {action['name']} {action['args']}？[y/N] ").strip().lower()
-            decisions.append(
-                {"type": "approve"} if answer in {"y", "yes"}
-                else {"type": "reject", "message": "用户未批准这次文件写入"})
-        run_input = None
-        run_cfg = {**cfg, "resume": {"decisions": decisions}}
 
-    values = app.get_state(cfg).values
+        if not question:
+            if one_shot is not None:
+                break
+            continue
+        if question.strip().lower() in {"exit", "quit", "退出"}:
+            print("再见！")
+            break
+
+        values = run_turn(app, cfg, question)
+        print("\n助手：", ex03._brief(values["messages"][-1]))
+        print(f"[本 thread 已保存 {len(values['messages'])} 条消息]")
+
+        if one_shot is not None:
+            break
+
     files = sorted(item["path"] for item in (backend.glob("*").matches or []))
-    print(f"\n消息 {len(values['messages'])} 条；待办 {len(values.get('todos') or [])} 项；"
-          f"workspace 文件 {files}")
-    print("最终回答：", ex03._brief(values["messages"][-1]))
+    print(f"workspace 文件：{files}")

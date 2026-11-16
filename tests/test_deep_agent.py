@@ -170,6 +170,29 @@ def test_state_survives_sqlite_checkpoint(tmp_path):
     assert len(values["messages"]) == 4            # user/ai/tool_result/ai
 
 
+def test_same_thread_supports_consecutive_interactive_turns():
+    model = FakeModel([
+        [_text("记住了，你叫小明")],
+        [_text("你叫小明")],
+    ])
+    app = create_deep_agent(model, checkpointer=InMemorySaver())
+    cfg = {"thread_id": "interactive-chat"}
+
+    app.invoke({"messages": [
+        {"id": "h1", "role": "user", "content": "我叫小明"}]}, config=cfg)
+    out = app.invoke({"messages": [
+        {"id": "h2", "role": "user", "content": "我叫什么？"}]}, config=cfg)
+
+    assert out["messages"][-1]["content"][0]["text"] == "你叫小明"
+    assert len(out["messages"]) == 4
+    second_request = model.requests[1]
+    assert [message["role"] for message in second_request.messages] == [
+        "user", "assistant", "user"]
+    assert second_request.messages[0]["content"] == "我叫小明"
+    assert second_request.messages[1]["content"] == [_text("记住了，你叫小明")]
+    assert second_request.messages[2]["content"] == "我叫什么？"
+
+
 def test_filesystem_backend_middleware_runs_real_file_tools(tmp_path):
     backend = FilesystemBackend(tmp_path)
     assert backend.write("/obsolete.txt", "remove me").error is None
