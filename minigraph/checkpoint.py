@@ -79,18 +79,23 @@ class Checkpoint:
     # 触发条件：channel_versions[chan] > versions_seen[node][chan]。
     versions_seen: dict[str, dict[str, int]] = field(default_factory=dict)
 
-    # ---- DeltaChannel 的写入日志 -------------------------------------
+    # ---- 写入日志 -----------------------------------------------------
     #
-    # 这一步里各个通道收到的**增量写入**，按 (通道, 值) 记。
-    # 只给 DeltaChannel 用：它的值不进 checkpoint，靠重放这些增量重建。
+    # 这一步里各个通道收到的**全部写入**（数据通道 + 触发通道），按
+    # (通道, 值) 记 —— 对齐 LangGraph 的 writes 表：一个任务的所有
+    # 写入都持久化，branch:to:X = null 这种触发信号也留痕。
     #
     # 形状是 list[(channel, value)]，同一超步内多个节点写同一通道就
-    # 有多条（顺序 = 节点执行顺序）。
+    # 有多条（顺序 = 写入应用顺序：输入 -> __start__ -> 各节点）。
     #
-    # 存储上它是**独立的写入日志**，不是 checkpoint blob 的一部分
-    # （对齐 LangGraph 的 writes 表）：SqliteSaver 把它存进 writes 表，
-    # 读的时候按 idx 保序拼回这里。所以对使用者来说 Checkpoint 仍是
-    # 自包含的 —— pending_writes 是个查询视图。
+    # DeltaChannel 是主要消费者：它的值不进 checkpoint，靠重放这些
+    # 增量重建（重放按通道名挑取，控制写入不参与）。控制写入的价值是
+    # 让这份日志成为完整的执行记录：谁写了什么、谁唤醒了谁。
+    #
+    # 存储上它是**独立的写入日志**，不是 checkpoint blob 的一部分：
+    # SqliteSaver 把它存进 writes 表，读的时候按 idx 保序拼回这里。
+    # 所以对使用者来说 Checkpoint 仍是自包含的 —— pending_writes
+    # 是个查询视图。
     pending_writes: list[tuple[str, Any]] = field(default_factory=list)
 
     # DeltaChannel 的快照节奏计数器：通道名 -> (写入次数, 距上次快照的超步数)。

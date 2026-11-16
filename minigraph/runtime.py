@@ -545,7 +545,11 @@ class CompiledGraph:
         snap.versions_seen = {k: dict(v) for k, v in seen.items()}
         snap.next = tuple(t.name for t in upcoming)
         snap.tasks = [t.send if t.is_push else t.name for t in upcoming]
-        snap.pending_writes = list(rt.input_writes)
+        # 数据写入 + as_node 出边的触发写入都记（对齐 LangGraph：
+        # update_state 的 put_writes 同样含 branch:to:* 控制写入）。
+        # 顺序 = 应用顺序：先写状态通道，再点亮出边。
+        snap.pending_writes = (list(rt.input_writes)
+                               + [(c, v) for c, v in writes])
         # 落过快照的通道，计数器归零
         counters = dict(snap.delta_counters or {})
         for chan, _ in rt.input_writes:
@@ -754,6 +758,8 @@ class CompiledGraph:
                         if rt.updated is None:
                             rt.updated = set()
                         rt.updated.add(chan)
+                        # __start__ 的触发写入同样进 writes 表。
+                        rt.input_writes.append((chan, None))
                     rt.seen[START] = {
                         start_spec.triggers[0]: rt.versions[start_spec.triggers[0]]
                     }
@@ -792,6 +798,10 @@ class CompiledGraph:
                 rt.channels[chan].update([None])
                 rt.versions[chan] = start_version
                 rt.updated.add(chan)
+                # 触发写入也进 writes 表（对齐 LangGraph：__start__ 的
+                # branch:to:<入口> = null 同样落 checkpoint_writes）。
+                # 跟在数据输入之后 —— 与应用顺序一致。
+                rt.input_writes.append((chan, None))
             rt.seen[START] = {start_spec.triggers[0]: rt.versions[start_spec.triggers[0]]}
         return rt
 
@@ -873,10 +883,12 @@ class CompiledGraph:
             }
 
             if saver and thread_id:
-                # 本步的增量写入：delta 通道靠它重建状态。
-                # 只记数据通道（状态字段），触发通道的写入不参与重放。
-                step_writes = [(c, v) for _, c, v in writes
-                               if c in self.reducers]
+                # 本步的**全部**写入都记进 writes 表 —— 数据通道和触发
+                # 通道都记（对齐 LangGraph 的 put_writes：一个任务的
+                # 所有写入都持久化，branch:to:X = null 也留痕）。
+                # delta 重放只按通道名挑它要的那几条，控制写入用不上，
+                # 但这份日志因此是完整的执行记录：谁写了什么、谁唤醒了谁。
+                step_writes = [(c, v) for _, c, v in writes]
                 # 输入的写入算第 0 步 —— 并进**第一份** checkpoint 的
                 # pending_writes，否则 delta 通道重建时输入这段就丢了。
                 if rt.input_writes:

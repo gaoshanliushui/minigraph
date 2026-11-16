@@ -338,7 +338,13 @@ class S(State):
 | 表 | 装什么 |
 | --- | --- |
 | `checkpoints` | 内核状态 blob（`values` / `channel_values` / 版本 / 水位线）+ `parent_checkpoint_id` |
-| `writes` | 每份 checkpoint 当步的增量写入，`(checkpoint_id, idx)` 保序 |
+| `writes` | 每份 checkpoint 当步的**全部**写入（数据 + 触发通道），`(checkpoint_id, idx)` 保序 |
+
+写入日志**不分数据通道和控制通道**（对齐 LangGraph 的 `put_writes`）：
+`messages` 的增量、`branch:to:X = null` 的触发信号、输入写入、`__start__`
+点亮入口，全都按应用顺序记录。delta 重放只按通道名挑它要的那几条；
+控制写入不参与重放，但让这份日志成为完整的执行记录 —— 谁写了什么、
+谁唤醒了谁，都在表里。
 
 `Checkpoint.pending_writes` 是个**查询视图**：写入时拆进 `writes` 表，
 读出时拼回 —— Checkpoint 对使用者仍是自包含的。

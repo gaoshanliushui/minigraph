@@ -82,13 +82,22 @@ def test_delta_value_not_stored_in_values():
 
 
 def test_pending_writes_recorded():
-    """每步的增量写入要记进 pending_writes —— 重放靠它。"""
+    """
+    每步的**全部**写入都记进 pending_writes —— 数据通道和触发通道都记
+    （对齐 LangGraph 的 writes 表：branch:to:X = null 也留痕）。
+    """
     app = _build(InMemorySaver())
     app.invoke({"messages": [{"id": "h1", "role": "human", "content": "q"}]},
                {"thread_id": "t"})
     raw = app.checkpointer.list("t")[-1]
-    chans = [c for c, _ in raw.pending_writes]
-    assert chans == ["messages", "messages"]   # 输入 + 节点写入
+    # 顺序 = 应用顺序：输入 -> __start__ 点亮入口 -> 节点写入
+    assert [c for c, _ in raw.pending_writes] == [
+        "messages", "branch:to:a", "messages"]
+    # 触发信号没有载荷（版本才重要），值是 None
+    assert raw.pending_writes[1][1] is None
+    # delta 重放只按通道名挑 messages 那几条，控制写入不参与
+    h = app.checkpointer.get_delta_channel_history("t", ["messages"])
+    assert len(h["messages"]["writes"]) == 2
 
 
 # ---------------------------------------------------------------- 2. 重建
@@ -448,11 +457,12 @@ def test_pending_writes_stored_in_writes_table():
 
     rows = saver.conn.execute(
         "SELECT channel, idx FROM writes ORDER BY idx").fetchall()
-    assert [r[0] for r in rows] == ["messages", "messages"]
-    assert [r[1] for r in rows] == [0, 1], "idx 保住同一步内多条写入的顺序"
+    assert [r[0] for r in rows] == ["messages", "branch:to:a", "messages"]
+    assert [r[1] for r in rows] == [0, 1, 2], "idx 保住同一步内多条写入的顺序"
 
     # 视图拼回：拿到的 Checkpoint 仍是自包含的
-    assert [c for c, _ in saver.get("t").pending_writes] == ["messages", "messages"]
+    assert [c for c, _ in saver.get("t").pending_writes] == [
+        "messages", "branch:to:a", "messages"]
 
 
 def test_parent_chain_links_linear_history():
@@ -575,7 +585,7 @@ def test_legacy_db_migrates_and_replays():
     hist = saver.list("t")
     assert hist[0].parent_id is None
     assert hist[1].parent_id == hist[0].id, "旧线性历史按 seq 回填 parent"
-    assert len(hist[-1].pending_writes) == 2, "旧格式 pending_writes 回退读取"
+    assert len(hist[-1].pending_writes) == 3, "旧格式 pending_writes 回退读取"
 
     # ④ 旧数据能重建；继续写入（新格式）后依然正确
     app2 = _build(saver)
