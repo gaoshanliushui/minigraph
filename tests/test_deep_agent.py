@@ -4,6 +4,7 @@ model 是 callable(ModelRequest) 协议，测试用脚本化 fake —— 不依�
 SDK、不需要 API key，但走的是完整的图回环与 state 更新。
 """
 
+from minigraph.backends import FilesystemBackend
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.deep_agent import create_deep_agent
 from minigraph.middleware import middleware
@@ -164,3 +165,116 @@ def test_state_survives_sqlite_checkpoint(tmp_path):
     assert values["files"] == {"/a.txt": "hello"}
     assert values["todos"] == [{"content": "x", "status": "pending"}]
     assert len(values["messages"]) == 4            # user/ai/tool_result/ai
+
+
+def test_filesystem_backend_middleware_runs_real_file_tools(tmp_path):
+    backend = FilesystemBackend(tmp_path)
+    assert backend.write("/obsolete.txt", "remove me").error is None
+    model = FakeModel([
+        [_call("write", "write_file",
+               {"path": "/notes.md", "content": "alpha\nbeta\n"})],
+        [_call("read", "read_file", {"path": "/notes.md", "limit": 1}),
+         _call("glob", "glob", {"pattern": "*.md"}),
+         _call("grep", "grep", {"pattern": "alpha"}),
+         _call("ls", "ls", {})],
+        [_call("edit", "edit_file", {
+            "path": "/notes.md", "old_string": "alpha", "new_string": "ALPHA"})],
+        [_call("delete", "delete", {"path": "/obsolete.txt"})],
+        [_text("done")],
+    ])
+    app = create_deep_agent(model, backend=backend)
+    out = app.invoke(dict(_INPUT), config={"thread_id": "real-files"})
+    results = _results(out)
+
+    assert "alpha" in results["read"]
+    assert "offset=1" in results["read"]
+    assert "/notes.md" in results["glob"]
+    assert "/notes.md:1:alpha" in results["grep"]
+    assert "/notes.md" in results["ls"] and "/obsolete.txt" in results["ls"]
+    assert "1 replacements" in results["edit"]
+    assert "Successfully deleted" in results["delete"]
+    assert (tmp_path / "notes.md").read_text() == "ALPHA\nbeta\n"
+    assert not (tmp_path / "obsolete.txt").exists()
+    assert out["files"] == {}                     # 不再写 state 虚拟文件系统
+
+    first_request = model.requests[0]
+    names = {item["name"] for item in first_request.tools}
+    assert {"read_file", "write_file", "edit_file", "glob", "grep", "delete"} <= names
+    assert "持久化 backend" in first_request.system
+
+
+def test_skills_option_loads_and_discloses_through_real_backend(tmp_path):
+    backend = FilesystemBackend(tmp_path)
+    backend.write("/skills/research/SKILL.md", """---
+name: research
+description: Research workflow
+---
+FULL SKILL BODY
+""")
+    model = FakeModel([
+        [_call("read", "read_file", {"path": "/skills/research/SKILL.md"})],
+        [_text("done")],
+    ])
+    app = create_deep_agent(model, backend=backend, skills=["/skills"])
+    out = app.invoke(dict(_INPUT), config={"thread_id": "skills-option"})
+
+    assert out["skills_metadata"][0]["name"] == "research"
+    assert "Research workflow" in model.requests[0].system
+    assert "FULL SKILL BODY" in _results(out)["read"]
+
+
+def test_default_summarization_compacts_request_and_offloads_history(tmp_path):
+    class ProfileFakeModel(FakeModel):
+        profile = {"max_input_tokens": 10}
+
+    backend = FilesystemBackend(tmp_path)
+    model = ProfileFakeModel([
+        [_text("condensed history")],              # 默认摘要中间件的内部模型调用
+        [_text("done")],                           # 主 agent 的模型调用
+    ])
+    app = create_deep_agent(model, backend=backend)
+    out = app.invoke({"messages": [
+        {"id": "h1", "role": "user", "content": "first"},
+        {"id": "h2", "role": "user", "content": "second"},
+    ]}, config={"thread_id": "default-summary"})
+
+    assert len(model.requests) == 2
+    main_request = model.requests[1]
+    assert len(main_request.messages) == 2
+    assert "condensed history" in main_request.messages[0]["content"]
+    assert main_request.messages[1]["content"] == "second"
+    assert "id" not in main_request.messages[0]
+    assert out["summarization_event"]["cutoff_index"] == 1
+    history_path = out["summarization_event"]["file_path"]
+    history = backend.download_files([history_path])[0].content.decode()
+    assert "first" in history and "second" not in history
+
+
+def test_subagent_inherits_backend_file_middleware(tmp_path):
+    backend = FilesystemBackend(tmp_path)
+
+    def model(request):
+        is_subagent = any(
+            message.get("content") == "write child" for message in request.messages)
+        has_tool_result = any(
+            isinstance(message.get("content"), list)
+            and any(block.get("type") == "tool_result"
+                    for block in message["content"])
+            for message in request.messages)
+        if is_subagent:
+            if not has_tool_result:
+                return [_call("child-write", "write_file",
+                              {"path": "/child.txt", "content": "from subagent"})]
+            return [_text("child done")]
+        if not has_tool_result:
+            return [_call("task", "task", {
+                "description": "write", "prompt": "write child",
+                "subagent_type": "general-purpose"})]
+        return [_text("parent done")]
+
+    app = create_deep_agent(model, backend=backend)
+    out = app.invoke(dict(_INPUT), config={"thread_id": "subagent-files"})
+
+    assert (tmp_path / "child.txt").read_text() == "from subagent"
+    assert "child done" in _results(out)["task"]
+    assert out["files"] == {}

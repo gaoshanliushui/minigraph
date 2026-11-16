@@ -1,16 +1,17 @@
 """
 示例 4：create_deep_agent —— 模仿 deepagents 的深度代理
 
-在示例 3 的同一张 ReAct 回环上，用工厂方法一键组装出带**规划、虚拟文件
-系统、子代理**三大能力的深度代理（minigraph/deep_agent.py）：
+在示例 3 的同一张 ReAct 回环上，用工厂方法一键组装出带**规划、真实文件
+backend、子代理和自动摘要**能力的深度代理（minigraph/deep_agent.py）：
 
-    app = create_deep_agent(llm, tools=[get_weather],
+    backend = FilesystemBackend(_ROOT / ".deep_agent_workspace")
+    app = create_deep_agent(llm, tools=[get_weather], backend=backend,
                             system_prompt="你是旅行规划助手。",
                             checkpointer=SqliteSaver(...))
 
     内置工具：write_todos（待办清单 -> state["todos"]）
-              ls/read_file/write_file/edit_file（虚拟文件系统 -> state["files"]）
-              task（派子代理跑独立 ReAct 回环，主对话只拿结论）
+              ls/read_file/write_file/edit_file/glob/grep/delete（真实 backend）
+              task（派子代理跑独立 ReAct 回环，子代理共享 backend）
 
 运行（复用示例 3 的 .env 多 provider 配置）：
 
@@ -19,8 +20,9 @@
 
 观察点：
   - stream 输出里能看到模型先 write_todos 拆任务，再逐步执行、更新清单；
-  - 中间产物被写进虚拟文件（state["files"]），最后打印文件清单；
-  - 独立子任务通过 task 派给 general-purpose 子代理。
+  - 中间产物通过 FilesystemMiddleware 写进 .deep_agent_workspace，最后打印文件清单；
+  - 独立子任务通过 task 派给 general-purpose 子代理，并共享同一个 backend；
+  - 达到上下文阈值时 SummarizationMiddleware 自动压缩模型输入并转存历史。
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from minigraph.backends import FilesystemBackend
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.deep_agent import create_deep_agent
 from minigraph.middleware import ModelRequest
@@ -72,9 +75,11 @@ if __name__ == "__main__":
     except RuntimeError as e:
         sys.exit(str(e))
 
+    backend = FilesystemBackend(_ROOT / ".deep_agent_workspace")
     app = create_deep_agent(
         llm,
         tools=[get_weather],
+        backend=backend,
         system_prompt="你是旅行规划助手，回答用中文。",
         checkpointer=SqliteSaver(str(_ROOT / "minigraph.db")),
     )
@@ -92,10 +97,9 @@ if __name__ == "__main__":
         if "todos" in update:
             for t in update["todos"]:
                 print(f"           todo [{t.get('status')}] {t.get('content')}")
-        if "files" in update:
-            print(f"           files 更新: {sorted(update['files'])}")
 
     values = app.get_state(cfg).values
+    files = sorted(item["path"] for item in (backend.glob("*").matches or []))
     print(f"\n消息 {len(values['messages'])} 条；待办 {len(values.get('todos') or [])} 项；"
-          f"文件 {sorted((values.get('files') or {}))}")
+          f"workspace 文件 {files}")
     print("最终回答：", ex03._brief(values["messages"][-1]))

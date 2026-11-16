@@ -12,6 +12,7 @@
 
 Deep agents 中间件：
 
+    filesystem          把可插拔 backend 暴露为文件工具
     skills              技能元数据发现、提示注入和按需全文披露
     summarization       上下文摘要，原始历史保留并转存到 backend
 
@@ -67,6 +68,7 @@ from .model_call_limit import (
 )
 from .model_fallback import ModelFallbackMiddleware
 from .model_retry import ModelRetryMiddleware
+from .filesystem import FILESYSTEM_SYSTEM_PROMPT, FilesystemMiddleware
 from .skills import (
     SKILLS_SYSTEM_PROMPT,
     SkillMetadata,
@@ -137,6 +139,8 @@ __all__ = [
     "ToolCallLimitExceededError",
     "ToolRetryMiddleware",
     # Deep agents
+    "FilesystemMiddleware",
+    "FILESYSTEM_SYSTEM_PROMPT",
     "SkillsMiddleware",
     "SkillsState",
     "SkillMetadata",

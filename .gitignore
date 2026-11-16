@@ -10,6 +10,7 @@ coverage
 *.lock
 log/
 .codegraph/
+.deep_agent_workspace/
 
 .venv/
 .pytest_cache/

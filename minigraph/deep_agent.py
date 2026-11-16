@@ -23,18 +23,18 @@
 内置工具（对齐 deepagents 的三大能力）：
 
   规划      write_todos(todos)              待办清单，全量替换，存 state["todos"]
-  文件系统  ls / read_file / write_file / edit_file
-            **虚拟**文件系统，存 state["files"]（{路径: 内容}）—— 不碰真实
-            磁盘，可随 checkpoint 持久化、可时间旅行；用来卸载中间结果，
-            避免长上下文膨胀（deepagents 文件系统的核心动机）
+  文件系统  默认是 state["files"] 里的虚拟文件工具，可随 checkpoint 持久化；
+            传 backend=FilesystemBackend(...) 后由 FilesystemMiddleware 提供
+            ls/read_file/write_file/edit_file/glob/grep/delete，读写真实 backend
   子代理    task(description, prompt, subagent_type)
             派一个独立子代理跑完整 ReAct 回环（独立消息历史），
-            主对话只拿到它的最终结论
+            主对话只拿到它的最终结论；子代理继承同一个 backend
 
-Skills / Summarization 可通过 ``middleware=[...]`` 注入，对应 state schema
-会自动并入本图；二者默认不启用。与真实 deepagents 仍有差异：无 memory/
-response_format；无 execute（shell 需要沙箱后端）；文件系统是 state 内的
-虚拟实现而非可插拔 backend；子代理不支持 async/远程、不可再嵌套 task。
+Summarization 默认启用，可用 summarization=False 关闭；skills=["/skills"]
+会自动创建 SkillsMiddleware。显式传入的同名中间件替换默认项，其余中间件
+插在核心栈之后、Skills 之前。与真实 deepagents 仍有差异：无 memory/
+response_format；无 execute（shell 需要沙箱后端）；子代理不支持 async/远程、
+不可再嵌套 task。
 
 工具调用默认带一个最内层的异常兜底中间件（工具异常 -> 错误文本），
 用户 middleware 在它外层；模型调用不经过这个工具兜底，需要模型重试或异常
@@ -50,10 +50,13 @@ from typing import Annotated, Any, Callable
 from .builder import StateGraph
 from .constants import END
 from .middleware import (
+    FilesystemMiddleware,
     MiddlewareStack,
     ModelRequest,
+    SkillsMiddleware,
     ToolRequest,
     agent_state_schema,
+    create_summarization_middleware,
     wire_middleware_graph,
     wrap_tool_call,
 )
@@ -65,9 +68,9 @@ BASE_PROMPT = """\
 
 - 规划：收到复杂任务先用 write_todos 拆成待办清单，进行中及时把各项标记为
   in_progress / completed；清单是全量替换，每次写完整版本。
-- 文件系统：你有一个虚拟文件系统（ls/read_file/write_file/edit_file）。
-  把中间结果、笔记、长文本写进文件，需要时再读回，避免上下文膨胀；
-  最终交付物（计划、报告、代码）也应该落成文件。
+- 文件系统：使用模型请求中实际提供的文件工具保存中间结果、笔记和长文本，
+  需要时再读回，避免上下文膨胀；最终交付物（计划、报告、代码）也应该落成文件。
+  不要假设存在请求工具清单里没有的 glob/grep/delete 等能力。
 - 子代理：独立、无需看主对话上下文的子任务，用 task 派给子代理，
   主对话只保留它的结论。派工时把必要背景写进 prompt。
 - 完成后用简洁的文字总结：做了什么、结果文件在哪里。"""
@@ -182,9 +185,33 @@ def _tool_guard(request, handler):
 # 组装
 # ---------------------------------------------------------------------------
 
+def _merge_middleware(base: list, custom, tail: list) -> list:
+    """同名自定义项原位替换默认项，新项放在核心栈之后、tail 之前。"""
+    def name(mw) -> str:
+        # @middleware 允许不继承 Middleware 的 duck-typed 类；与核心图接线
+        # 一样，缺少 .name 时回退到类名。
+        return getattr(mw, "name", None) or type(mw).__name__
+
+    result = [*base, *tail]
+    positions = {name(mw): index for index, mw in enumerate(result)}
+    additions = []
+    addition_names = set()
+    for mw in custom:
+        middleware_name = name(mw)
+        if middleware_name in positions:
+            result[positions[middleware_name]] = mw
+        elif middleware_name in addition_names:
+            raise ValueError(f"重复的自定义中间件名称：{middleware_name!r}")
+        else:
+            additions.append(mw)
+            addition_names.add(middleware_name)
+    return [*result[:len(base)], *additions, *result[len(base):]]
+
+
 def _build_agent(model, registry: dict[str, Tool], prompt: str,
                  middleware, subapps: dict[str, Any] | None,
-                 subagent_specs: list[dict], checkpointer):
+                 subagent_specs: list[dict], checkpointer, *, backend=None,
+                 skills=None, summarization: bool = True):
     registry = dict(registry)
     if subapps is not None:
         desc = "；".join(f"{s['name']}（{s.get('description', '')}）"
@@ -213,7 +240,25 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
 
         registry["task"] = task
 
-    stack = MiddlewareStack([*middleware, _tool_guard])
+    base_middleware = []
+    if backend is not None:
+        base_middleware.append(FilesystemMiddleware(backend=backend))
+    if summarization:
+        base_middleware.append(create_summarization_middleware(model, backend))
+    tail_middleware = []
+    if skills:
+        if backend is None:
+            raise ValueError("skills= 需要同时提供 backend")
+        tail_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+    stack = MiddlewareStack([
+        *_merge_middleware(base_middleware, middleware, tail_middleware),
+        _tool_guard,
+    ])
+    # 中间件不仅包调用，也可以提供工具。backend 文件工具在这里覆盖同名的
+    # state 虚拟工具，模型看到的 schema 与 tool_node 的 registry 始终一致。
+    for mw in stack.middlewares:
+        for middleware_tool in getattr(mw, "tools", ()):
+            registry[middleware_tool.name] = middleware_tool
 
     def call_model(state: DeepAgentState) -> dict:
         api_messages = [
@@ -273,7 +318,10 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
                       system_prompt: str | None = None,
                       middleware=(),
                       subagents: list[dict] | None = None,
-                      checkpointer=None):
+                      checkpointer=None,
+                      backend=None,
+                      skills: list[str] | None = None,
+                      summarization: bool = True):
     """组装一个深度代理（签名与语义对照 deepagents.create_deep_agent）。
 
     参数含义见模块 docstring。返回编译好的图，直接 invoke/stream 即可：
@@ -282,7 +330,11 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
                                 system_prompt="你是调研助手")
         out = app.invoke({"messages": [{"role": "user", "content": "..."}]},
                          config={"thread_id": "t1"})
-        out["todos"], out["files"]   # 规划清单与虚拟文件系统也在 state 里
+        out["todos"], out["files"]   # 规划清单与默认虚拟文件系统也在 state 里
+
+    传入 ``backend=FilesystemBackend(root_dir)`` 后，文件工具直接操作该
+    backend，不再写入 state["files"]；``skills=["/skills"]`` 从同一 backend
+    加载技能。Summarization 默认启用，可用 ``summarization=False`` 关闭。
     """
     registry: dict[str, Tool] = {t.name: t for t in _builtin_tools()}
     for t in tools or []:
@@ -299,9 +351,11 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
                                 "\n\n".join(p for p in
                                             [s.get("prompt") or system_prompt,
                                              BASE_PROMPT] if p),
-                                (), None, [], None)
+                                (), None, [], None, backend=backend,
+                                skills=skills, summarization=summarization)
         for s in specs
     }
     prompt = "\n\n".join(p for p in [system_prompt, BASE_PROMPT] if p)
     return _build_agent(model, registry, prompt, middleware,
-                        subapps, specs, checkpointer)
+                        subapps, specs, checkpointer, backend=backend,
+                        skills=skills, summarization=summarization)

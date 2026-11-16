@@ -426,7 +426,7 @@ def test_summarization_trim_limits_only_summary_input_not_offloaded_history():
     mw = SummarizationMiddleware(
         backend=backend, trigger=("tokens", 1), keep=("messages", 1),
         token_counter=counter, trim_tokens_to_summarize=90, summarizer=summarize)
-    raw = [_msg(i, value) for i, value in enumerate([100, 80, 50, 40])]
+    raw = [_msg(i, str(value)) for i, value in enumerate([100, 80, 50, 40])]
     update = mw.before_model({"messages": raw})
     assert seen == ["50"]
     history = backend.files[update["summarization_event"]["file_path"]].decode()

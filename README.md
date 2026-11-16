@@ -450,8 +450,8 @@ harness 使用 `stream_mode="debug"` 中的超步号还原并行批次。
    跑 `uv run --extra llm python examples/03_real_llm_agent.py`，看同一张图换成真模型驱动
    （官方 anthropic SDK + python-dotenv，minigraph 内核仍零依赖）。
 8. 跑 `uv run --extra llm python examples/04_deep_agent.py`：`create_deep_agent`
-   （模仿 deepagents）一键组出带规划（write_todos）、虚拟文件系统、子代理（task）
-   的深度代理，复用同一份 .env 配置。
+   （模仿 deepagents）一键组出带规划（write_todos）、真实文件 backend、自动摘要、
+   子代理（task）的深度代理，复用同一份 .env 配置；文件写入 `.deep_agent_workspace/`。
 
 ### 配套文档
 
