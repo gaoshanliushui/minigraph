@@ -15,6 +15,7 @@ Deep agents 中间件：
     filesystem          把可插拔 backend 暴露为文件工具
     patch_tool_calls    为历史中的悬空 tool_use 补错误 tool_result
     skills              技能元数据发现、提示注入和按需全文披露
+    subagents           通过 task 工具派发隔离子代理并回传最终结论
     summarization       上下文摘要，原始历史保留并转存到 backend
 
 用：
@@ -77,6 +78,16 @@ from .skills import (
     SkillSource,
     SkillsMiddleware,
     SkillsState,
+)
+from .subagents import (
+    DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
+    DEFAULT_SUBAGENT_PROMPT,
+    GENERAL_PURPOSE_SUBAGENT,
+    TASK_TOOL_DESCRIPTION,
+    CompiledSubAgent,
+    SubAgent,
+    SubAgentMiddleware,
+    create_sub_agent,
 )
 from .summarization import (
     DEFAULT_SUMMARY_PROMPT,
@@ -149,6 +160,14 @@ __all__ = [
     "SkillMetadata",
     "SkillSource",
     "SKILLS_SYSTEM_PROMPT",
+    "SubAgent",
+    "CompiledSubAgent",
+    "SubAgentMiddleware",
+    "GENERAL_PURPOSE_SUBAGENT",
+    "DEFAULT_SUBAGENT_PROMPT",
+    "DEFAULT_GENERAL_PURPOSE_DESCRIPTION",
+    "TASK_TOOL_DESCRIPTION",
+    "create_sub_agent",
     "SummarizationMiddleware",
     "SummarizationState",
     "SummarizationEvent",

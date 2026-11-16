@@ -16,7 +16,8 @@
                  对齐真实实现的提示组装顺序）。
   - middleware   额外中间件。状态钩子自动生成节点（add_hook_nodes，
                  create_agent 拓扑）；around 钩子包模型/工具调用。
-  - subagents    子代理规格：[{"name", "description", "prompt"?}]。
+  - subagents    声明式规格：[{"name", "description", "system_prompt"?,
+                 "model"?, "tools"?, "middleware"?}]，或预编译 {"runnable": ...}。
                  默认带一个 general-purpose 子代理（与主代理同工具、无 task）。
   - checkpointer 与 compile(checkpointer=...) 相同。
 
@@ -26,9 +27,10 @@
   文件系统  默认是 state["files"] 里的虚拟文件工具，可随 checkpoint 持久化；
             传 backend=FilesystemBackend(...) 后由 FilesystemMiddleware 提供
             ls/read_file/write_file/edit_file/glob/grep/delete，读写真实 backend
-  子代理    task(description, prompt, subagent_type)
-            派一个独立子代理跑完整 ReAct 回环（独立消息历史），
-            主对话只拿到它的最终结论；子代理继承同一个 backend
+  子代理    task(description, subagent_type="general-purpose", prompt=None)
+            由 SubAgentMiddleware 提供，派一个独立子代理跑完整 ReAct 回环
+            （独立消息历史），主对话只拿到最终结论；子代理继承同一个 backend。
+            prompt 是旧版任务说明参数的兼容别名，新调用只需 description。
 
 Summarization 默认启用，可用 summarization=False 关闭；PatchToolCallsMiddleware
 默认修复历史中的悬空 tool_use；skills=["/skills"] 会自动创建 SkillsMiddleware。
@@ -48,7 +50,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Annotated, Any, Callable
+from typing import Annotated, Callable
 
 from minigraph.builder import StateGraph
 from minigraph.constants import END
@@ -56,6 +58,7 @@ from minigraph.state import DeltaChannel, State, add_messages, merge_dict
 from minigraph.tools import Tool, tool
 
 from .middleware import (
+    GENERAL_PURPOSE_SUBAGENT,
     FilesystemMiddleware,
     HumanInTheLoopMiddleware,
     InterruptOnConfig,
@@ -63,6 +66,7 @@ from .middleware import (
     ModelRequest,
     PatchToolCallsMiddleware,
     SkillsMiddleware,
+    SubAgentMiddleware,
     ToolRequest,
     agent_state_schema,
     create_summarization_middleware,
@@ -91,14 +95,6 @@ class DeepAgentState(State):
 
 def _mid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
-
-
-def _texts(content) -> str:
-    """从一条消息的 content（str 或 blocks）里拼出纯文本。"""
-    if isinstance(content, str):
-        return content
-    return "\n".join(b.get("text", "") for b in content
-                     if isinstance(b, dict) and b.get("type") == "text")
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +175,15 @@ def _builtin_tools() -> list[Tool]:
     ]
 
 
+def _make_registry(tools=None) -> dict[str, Tool]:
+    """内置 state 工具 + 调用方工具；供主代理和声明式子代理复用。"""
+    registry: dict[str, Tool] = {t.name: t for t in _builtin_tools()}
+    for item in tools or []:
+        wrapped = item if isinstance(item, Tool) else tool(item)
+        registry[wrapped.name] = wrapped
+    return registry
+
+
 @wrap_tool_call
 def _tool_guard(request, handler):
     """默认最内层兜底：工具异常变成错误文本回给模型。"""
@@ -216,40 +221,15 @@ def _merge_middleware(base: list, custom, tail: list) -> list:
 
 
 def _build_agent(model, registry: dict[str, Tool], prompt: str,
-                 middleware, subapps: dict[str, Any] | None,
-                 subagent_specs: list[dict], checkpointer, *, backend=None,
-                 skills=None, summarization: bool = True, interrupt_on=None):
+                 middleware=(), checkpointer=None, *, backend=None,
+                 skills=None, summarization: bool = True, interrupt_on=None,
+                 subagent_middleware: SubAgentMiddleware | None = None):
     registry = dict(registry)
-    if subapps is not None:
-        desc = "；".join(f"{s['name']}（{s.get('description', '')}）"
-                         for s in subagent_specs)
-
-        @tool(name="task",
-              description=f"把独立子任务派给子代理执行，返回它的最终结论。"
-                          f"可用子代理：{desc}")
-        def task(description: str, prompt: str,
-                 subagent_type: str = "general-purpose") -> str:
-            """派发子任务。
-
-            Args:
-                description: 一句话说明要做什么（用于日志）
-                prompt: 给子代理的完整指令（它看不到主对话，背景要写全）
-                subagent_type: 子代理名，默认 general-purpose
-            """
-            app = subapps.get(subagent_type)
-            if app is None:
-                return f"错误：未知子代理 {subagent_type!r}，可用：{sorted(subapps)}"
-            out = app.invoke(
-                {"messages": [{"id": _mid("h"), "role": "user", "content": prompt}]},
-                config={"thread_id": f"sub-{_mid('t')}"},
-            )
-            return _texts(out["messages"][-1]["content"]) or "（子代理没有产出文本）"
-
-        registry["task"] = task
-
     base_middleware = []
     if backend is not None:
         base_middleware.append(FilesystemMiddleware(backend=backend))
+    if subagent_middleware is not None:
+        base_middleware.append(subagent_middleware)
     if summarization:
         base_middleware.append(create_summarization_middleware(model, backend))
     base_middleware.append(PatchToolCallsMiddleware())
@@ -358,27 +338,46 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
     恢复。每项决定支持 approve/edit/reject/respond，具体允许哪些由工具配置
     决定。当前该配置只作用于主代理，不会由 task 子代理继承。
     """
-    registry: dict[str, Tool] = {t.name: t for t in _builtin_tools()}
-    for t in tools or []:
-        t = t if isinstance(t, Tool) else tool(t)     # 裸函数自动包装
-        registry[t.name] = t
+    extra_tools = [
+        item if isinstance(item, Tool) else tool(item) for item in tools or []]
+    registry = _make_registry(extra_tools)
 
-    specs = [{"name": "general-purpose",
-              "description": "通用子代理：与主代理相同的工具（不含 task），"
-                             "适合独立的多步子任务"}]
-    specs += list(subagents or [])
-    # 子代理 = 同一套组装，但没有 task（不可再嵌套）、无 checkpointer
-    subapps = {
-        s["name"]: _build_agent(model, registry,
-                                "\n\n".join(p for p in
-                                            [s.get("prompt") or system_prompt,
-                                             BASE_PROMPT] if p),
-                                (), None, [], None, backend=backend,
-                                skills=skills, summarization=summarization)
-        for s in specs
-    }
+    # 工厂负责补齐声明式规格；SubAgentMiddleware 负责编译和实际 task 分发。
+    # 显式提供 general-purpose 时不再自动加默认项，调用方可以完整覆盖它。
+    specs: list[dict] = []
+    for raw in subagents or []:
+        if "runnable" in raw:
+            specs.append(dict(raw))
+            continue
+        spec = dict(raw)
+        spec["model"] = raw.get("model", model)
+        spec["tools"] = raw.get("tools", extra_tools) or []
+        subagent_prompt = raw.get("system_prompt")
+        if subagent_prompt is None:
+            subagent_prompt = raw.get("prompt")
+        if subagent_prompt is None:
+            subagent_prompt = system_prompt
+        spec["system_prompt"] = "\n\n".join(
+            part for part in [subagent_prompt, BASE_PROMPT] if part)
+        spec.setdefault("skills", skills)
+        spec["summarization"] = summarization
+        specs.append(spec)
+
+    if not any(spec["name"] == "general-purpose" for spec in specs):
+        general_purpose = {
+            **GENERAL_PURPOSE_SUBAGENT,
+            "model": model,
+            "tools": extra_tools,
+            "skills": skills,
+            "summarization": summarization,
+        }
+        general_purpose["system_prompt"] = "\n\n".join([
+            GENERAL_PURPOSE_SUBAGENT["system_prompt"], BASE_PROMPT])
+        specs.insert(0, general_purpose)
+
+    subagent_middleware = SubAgentMiddleware(backend=backend, subagents=specs)
     prompt = "\n\n".join(p for p in [system_prompt, BASE_PROMPT] if p)
     return _build_agent(model, registry, prompt, middleware,
-                        subapps, specs, checkpointer, backend=backend,
-                        skills=skills, summarization=summarization,
-                        interrupt_on=interrupt_on)
+                        checkpointer, backend=backend, skills=skills,
+                        summarization=summarization, interrupt_on=interrupt_on,
+                        subagent_middleware=subagent_middleware)
