@@ -13,7 +13,8 @@
             END
 
 这里把"LLM"换成一个规则函数，好处是：你能完整看到控制流，
-而不被模型的不确定性干扰。换成真的 ChatModel 只需修改 `call_model`。
+而不被模型的不确定性干扰。换成真的 ChatModel 只需修改 `call_model` ——
+真模型版本见 `examples/03_real_llm_agent.py`（官方 anthropic SDK）。
 
 运行：python examples/01_react_agent.py
 """

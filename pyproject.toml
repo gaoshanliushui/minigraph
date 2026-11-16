@@ -8,5 +8,15 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = []
 
+[project.optional-dependencies]
+# 只有 examples/03（真实 LLM 调用）需要第三方包；minigraph 内核保持零依赖。
+# 安装：uv sync --extra llm；运行：uv run --extra llm python examples/03_real_llm_agent.py
+llm = ["anthropic>=0.40", "python-dotenv>=1.0"]
+
+[dependency-groups]
+# pytest 显式声明：否则 uv sync 会把它从 venv 里清掉，uv run pytest 退到
+# 系统解释器，那里没有 anthropic —— 测试就被 importorskip 静默跳过。
+dev = ["pytest>=8"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["minigraph"]
