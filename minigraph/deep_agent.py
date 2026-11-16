@@ -36,8 +36,9 @@ Skills / Summarization 可通过 ``middleware=[...]`` 注入，对应 state sche
 response_format；无 execute（shell 需要沙箱后端）；文件系统是 state 内的
 虚拟实现而非可插拔 backend；子代理不支持 async/远程、不可再嵌套 task。
 
-模型/工具调用默认带一个最内层的异常兜底中间件（工具异常 -> 错误文本），
-用户 middleware 在它外层。
+工具调用默认带一个最内层的异常兜底中间件（工具异常 -> 错误文本），
+用户 middleware 在它外层；模型调用不经过这个工具兜底，需要模型重试或异常
+兜底时应显式加入 ModelRetryMiddleware 等 wrap_model_call 中间件。
 """
 
 from __future__ import annotations
