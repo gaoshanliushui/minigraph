@@ -296,6 +296,28 @@ def _fanout_then_join(b: Backend):
     return g
 
 
+# ---------------------------------------------------------------------------
+# 13. path_map 以 END 为键 -> 映射后的目标节点要跑
+# ---------------------------------------------------------------------------
+def _end_keyed_path_map(b: Backend):
+    """路由返回 END，path_map 把 END 翻译成 "cleanup"。
+
+    path_map 的翻译发生在 END 判断**之前**（LangGraph _finish：
+    destinations = [self.ends[r] for r in result]，映射完才写通道）。
+    顺序反了的话 cleanup 永远不会跑 —— 中间件的 after_agent 节点
+    正是挂在路由的 END 分支上的。
+    """
+    g = b.state_graph_cls(b.make_state({
+        "n": Annotated[int, operator.add],
+        "log": Annotated[list, operator.add],
+    }))
+    g.add_node("router", lambda s: {"n": 1})
+    g.add_node("cleanup", lambda s: {"log": ["cleanup"]})
+    g.add_edge(b.START, "router")
+    g.add_conditional_edges("router", lambda s: b.END, {b.END: "cleanup"})
+    return g
+
+
 SCENARIOS: list[Scenario] = [
     Scenario("linear", {"n": Annotated[int, operator.add],
                         "log": Annotated[list, operator.add]},
@@ -329,4 +351,7 @@ SCENARIOS: list[Scenario] = [
              _self_loop, {"n": 0}, config={"recursion_limit": 5}),
     Scenario("fanout_then_join", {"topics": list, "results": Annotated[list, operator.add]},
              _fanout_then_join, {"topics": [], "results": []}),
+    Scenario("end_keyed_path_map", {"n": Annotated[int, operator.add],
+                                    "log": Annotated[list, operator.add]},
+             _end_keyed_path_map, {"n": 0, "log": []}),
 ]

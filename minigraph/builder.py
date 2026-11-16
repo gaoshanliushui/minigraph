@@ -167,8 +167,9 @@ class StateGraph:
         for field, reducer in self.reducers.items():
             spec = self.channel_specs.get(field)
             if spec is not None:
-                # 显式声明的通道（DeltaChannel）：直接用，但要换个 key ——
-                # 通道的 key 是它自己的字段名，声明时可能写的是别的。
+                # 显式声明的通道（DeltaChannel / EphemeralValue）：直接用，
+                # 但要换个 key —— 通道的 key 是它自己的字段名，
+                # 声明时可能写的是别的。
                 ch = spec.copy()
                 ch.key = field
                 channels[field] = ch

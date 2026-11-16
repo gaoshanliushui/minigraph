@@ -32,6 +32,44 @@ def test_linear_and_conditional_loop():
     assert out["trace"].count("inc") == 3
 
 
+def test_path_map_is_applied_before_the_END_check():
+    """path_map 以 END 为键时，映射后的目标节点**要跑**（回归测试）。
+
+    路由函数返回 END，path_map 把 END 翻译成另一个节点 —— 中间件的
+    after_agent 就挂在这个分支上（路由的 END 分支 -> after_agent -> END）。
+
+    顺序必须是「先查 path_map，再判 END」。反了的话这个节点永远不会跑。
+    对齐 LangGraph：_finish() 里 destinations = [self.ends[r] for r in result]，
+    映射完才交给 writer，END 判断发生在映射**之后**。
+    """
+    class S(State):
+        n: int
+        log: str
+
+    g = StateGraph(S)
+    g.add_node("router", lambda s: {"n": s["n"] + 1})
+    g.add_node("cleanup", lambda s: {"log": "cleanup ran"})
+    g.add_conditional_edges("router", lambda s: END, {END: "cleanup"})
+    g.add_edge(START, "router")
+
+    out = g.compile().invoke({"n": 1, "log": ""})
+    assert out["log"] == "cleanup ran"
+
+
+def test_path_map_keyed_on_END_still_ends_the_graph_when_unmapped():
+    """没被 path_map 接住的 END 仍然是「结束」，不产生任何写入。"""
+    class S(State):
+        n: int
+
+    g = StateGraph(S)
+    g.add_node("router", lambda s: {"n": s["n"] + 1})
+    g.add_conditional_edges("router", lambda s: END, {"other": "router"})
+    g.add_edge(START, "router")
+
+    out = g.compile().invoke({"n": 1})
+    assert out["n"] == 2
+
+
 # ---------------------------------------------------------------- 2. reducer
 def test_reducer_merges_partial_updates():
     class S(State):

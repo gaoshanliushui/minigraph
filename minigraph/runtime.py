@@ -1566,8 +1566,12 @@ def _control_writes(spec: NodeSpec | None, snapshot: dict, update: Mapping[str, 
             if isinstance(p, Send):
                 writes.append((TASKS, p))
                 continue
-            if p == END:
-                continue
+            # **先查 path_map，再判 END**（对齐 LangGraph _finish 的顺序：
+            # destinations = [self.ends[r] for r in result]，映射完才写通道）。
+            # 顺序反了会丢掉「path_map 里以 END 为键」的分支 ——
+            # 比如中间件的 after_agent 节点就挂在路由的 END 分支上：
+            # 路由函数返回 END，path_map 把 END 翻译成 "LogCalls.after_agent"，
+            # 先判 END 的话这个节点永远不会跑。
             target = br["map"].get(p, p) if br["map"] else p
             if target == END:
                 continue

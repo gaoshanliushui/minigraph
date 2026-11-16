@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 from typing import Any, Mapping
 
-from .channels import BatchReducer, DeltaChannel
+from .channels import BatchReducer, BaseChannel, DeltaChannel
 from .constants import LAST_VALUE, MISSING, Reducer
 
 __all__ = [
@@ -120,11 +120,11 @@ class State(dict):
         for name, ann in _own_annotations(cls).items():
             if name.startswith("_") or name == "reducers":
                 continue
-            # DeltaChannel 走单独一条路：它自带 reducer，声明方式也不同。
-            delta = _extract_delta_channel(ann)
-            if delta is not None:
-                channels[name] = delta
-                reducers[name] = delta.reducer
+            # 显式声明的通道走单独一条路：通道自带 reducer，声明方式也不同。
+            chan = _extract_channel(ann)
+            if chan is not None:
+                channels[name] = chan
+                reducers[name] = getattr(chan, "reducer", None) or LAST_VALUE
                 field_types[name] = _extract_type(ann)
                 continue
             reducers[name] = _extract_reducer(ann) or LAST_VALUE
@@ -214,7 +214,7 @@ def _extract_reducer(ann) -> Reducer | None:
     return None
 
 
-# 从 `Annotated[T, ...]` 中取出 DeltaChannel。
+# 从 `Annotated[T, ...]` 中取出**显式声明的通道对象**。
 #
 # 什么时候调用：
 #   State.__init_subclass__ 遍历每条字段注解时调用。
@@ -224,16 +224,21 @@ def _extract_reducer(ann) -> Reducer | None:
 #   Annotated[list, DeltaChannel(add_messages, list)]  —— 显式给类型
 #
 # 为什么单独一条路：
-#   DeltaChannel 不是"reducer"，它是**整个通道对象**。它自带 reducer、
+#   通道对象不是"reducer"，它是**整个通道**。它自带 reducer、
 #   自带快照频率，编译期要拿它当通道用，而不是拿它当 reducer 用。
 #   混在 _extract_reducer 里会把通道当 reducer 传给 channel_for_field，
 #   然后造出一个错的 BinaryOperatorAggregate。
-def _extract_delta_channel(ann) -> Any:
+#
+# 支持哪些通道：DeltaChannel（消息用，稀疏存增量）、
+# EphemeralValue（中间件的 jump_to 用，每超步清空）。
+# 认 BaseChannel 而不是认具体子类，是为了以后加新通道类型时
+# 不用改这里 —— 凡是"自己就是一个通道"的都该走这条路。
+def _extract_channel(ann) -> Any:
     meta = getattr(ann, "__metadata__", None)
     if not meta:
         return None
     for item in meta:
-        if isinstance(item, DeltaChannel):
+        if isinstance(item, BaseChannel):
             return item
     return None
 

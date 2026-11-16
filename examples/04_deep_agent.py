@@ -76,7 +76,7 @@ if __name__ == "__main__":
         llm,
         tools=[get_weather],
         system_prompt="你是旅行规划助手，回答用中文。",
-        checkpointer=SqliteSaver(str(_ROOT / "minigraph_deep.db")),
+        checkpointer=SqliteSaver(str(_ROOT / "minigraph.db")),
     )
     cfg = {"thread_id": "deep-demo"}
     question = sys.argv[1] if len(sys.argv) > 1 else \
