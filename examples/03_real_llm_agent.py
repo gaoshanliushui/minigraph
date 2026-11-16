@@ -285,7 +285,7 @@ if __name__ == "__main__":
     except RuntimeError as e:
         sys.exit(str(e))
 
-    db = _ROOT / "minigraph_real.db"
+    db = _ROOT / "minigraph.db"
     app = build(SqliteSaver(str(db)))
     cfg = {"thread_id": "real-demo"}
 
