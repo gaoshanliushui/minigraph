@@ -266,6 +266,74 @@ app = g.compile(checkpointer=SqliteSaver("checkpoints.db"))
 tuple、bytes 都能原样还原），不用 pickle —— 反序列化不可信文件等于执行任意代码。
 代价是自定义类型的 state 值存不进去，会明确抛 `TypeError` 而不是悄悄丢数据。
 
+### 6.5 DeltaChannel：只存增量，不存全量
+
+普通通道（`BinaryOperatorAggregate`）每份 checkpoint 都**完整存一遍**累积后的值。
+对话历史越长，每份快照越大，于是总空间是 O(n²)：
+
+| 50 轮对话 | checkpoint 总大小 | 平均每份 |
+| --- | --- | --- |
+| 普通 `add_messages` | 2753 KB | 18.8 KB |
+| `DeltaChannel` | **141 KB** | **0.96 KB** |
+
+`DeltaChannel`（对齐 LangGraph 的 `langgraph/channels/delta.py`）换了个存法：
+**checkpoint 里不存它的值**，只存每一步的**增量写入**；状态靠
+「最近的快照 + 之后的增量重放」重建。
+
+```python
+from minigraph.state import DeltaChannel, State, add_messages
+
+class AgentState(State):
+    messages: Annotated[list, DeltaChannel(add_messages, list)]
+```
+
+三个机制：
+
+**① 值不进 checkpoint。** delta 通道既不出现在 `channel_values`，也不出现在
+`values` —— 值由「种子 + 增量写入」表达。恢复时沿 thread 的 checkpoint 链
+往回走，找到最近一个存过这个通道的祖先（**种子**），把之后的增量按旧→新
+重放回去。
+
+**② 两个计数器决定何时落完整快照。**
+
+| 计数器 | 含义 | 阈值 |
+| --- | --- | --- |
+| `updates` | 这个通道被写了几次 | `snapshot_frequency`（默认 1000） |
+| `supersteps` | 距上次快照过了几个超步 | `DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT`（默认 5000） |
+
+满足任一条就落一份 `DeltaSnapshot`（通道的完整值），并把计数归零。
+第二个上界很重要：一个**很久没被写**的通道，光靠"写入次数"算，重放链会
+一直变长；这个上界保证重放深度有天花板。
+
+**③ reducer 要满足"分结合并不变性"。**
+
+```
+reducer(reducer(state, xs), ys) == reducer(state, xs + ys)
+```
+
+因为重放时增量可能被合并成更大的批次。`add_messages`（按 id 追加/更新）、
+`operator.add`、追加 list 的自定义 reducer 都满足。
+
+minigraph 的 reducer 一律是二元的 `(old, new) -> merged`；LangGraph 的
+DeltaChannel reducer 是批量的 `(state, list[writes]) -> new_state`。两种都支持，
+用 `BatchReducer` 显式标记批量 reducer（靠 arity 判断不可靠）：
+
+```python
+from minigraph.channels import BatchReducer
+
+def merge(state, writes):
+    out = list(state)
+    for w in writes:
+        out.extend(w)
+    return out
+
+class S(State):
+    items: Annotated[list, DeltaChannel(BatchReducer(merge), list)]
+```
+
+实现落在 `minigraph/channels.py`（通道）、`minigraph/runtime.py`（快照节奏与
+重放）、`minigraph/checkpoint.py` 与 `checkpoint_sqlite.py`（祖先链遍历）。
+
 ---
 
 ## 与真实 LangGraph 的已知差异
@@ -279,6 +347,9 @@ tuple、bytes 都能原样还原），不用 pickle —— 反序列化不可信
 | 并发写错误类型 | `ConcurrentWriteError(RuntimeError)` | `InvalidUpdateError` |
 | 裸 dict 声明的 schema | 拿不到字段类型，reducer 通道初值为 `MISSING`（读未写过的字段会 `KeyError`） | TypedDict/Annotated 一定拿得到类型 |
 | checkpoint 历史 | 每个超步存一份 | 额外存「输入」那一份（`step=-1`/`0`） |
+| `DeltaChannel` reducer 签名 | 二元 `(old, new)` 为主，批量用 `BatchReducer` 标记 | 统一批量 `(state, list[writes])` |
+| `DeltaChannel` 的 `Overwrite` 语义 | 不支持（minigraph 没有 `Overwrite` 概念） | 支持，作为重放时的重置点 |
+| `recursion_limit` 的计数范围 | **单次调用**走了多少步 | **单次调用**走了多少步 |
 
 这些差异均有注释或测试标注；其余核心调度行为通过差分场景验证。
 

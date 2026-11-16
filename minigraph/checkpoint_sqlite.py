@@ -44,6 +44,7 @@ import uuid
 from typing import Any
 
 from .checkpoint import Checkpoint
+from .channels import DeltaSnapshot
 from .constants import MISSING
 from .control import Send
 
@@ -69,6 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_checkpoints_thread
 _CKPT_FIELDS = (
     "id", "step", "values", "next", "tasks", "interrupt", "interrupts",
     "resumes", "slots", "channel_values", "channel_versions", "versions_seen",
+    "pending_writes", "delta_counters",
 )
 
 
@@ -82,6 +84,8 @@ def _encode(obj: Any) -> Any:
         return {_TAG: "missing"}
     if isinstance(obj, Send):
         return {_TAG: "send", "node": obj.node, "arg": _encode(obj.arg)}
+    if isinstance(obj, DeltaSnapshot):
+        return {_TAG: "delta_snapshot", "value": _encode(obj.value)}
     if isinstance(obj, (set, frozenset)):
         return {_TAG: "set", "items": [_encode(v) for v in obj]}
     if isinstance(obj, tuple):
@@ -101,7 +105,7 @@ def _encode(obj: Any) -> Any:
     raise TypeError(
         f"无法序列化 {type(obj).__name__}；"
         f"SQLite checkpointer 只支持 JSON 原生类型、tuple/set/bytes、"
-        f"以及 minigraph 的 Send / MISSING"
+        f"以及 minigraph 的 Send / MISSING / DeltaSnapshot"
     )
 
 
@@ -118,6 +122,8 @@ def _decode(obj: Any) -> Any:
             return MISSING
         if tag == "send" and keys == {_TAG, "node", "arg"}:
             return Send(node=obj["node"], arg=_decode(obj["arg"]))
+        if tag == "delta_snapshot" and keys == {_TAG, "value"}:
+            return DeltaSnapshot(_decode(obj["value"]))
         if tag in ("set", "tuple") and keys == {_TAG, "items"}:
             items = [_decode(v) for v in obj["items"]]
             return set(items) if tag == "set" else tuple(items)
@@ -147,6 +153,9 @@ def _ckpt_from_dict(d: dict) -> Checkpoint:
         channel_values=d["channel_values"],
         channel_versions=d["channel_versions"],
         versions_seen=d["versions_seen"],
+        pending_writes=[(c, v) for c, v in d.get("pending_writes") or []],
+        delta_counters={k: tuple(v) for k, v in
+                        (d.get("delta_counters") or {}).items()},
     )
 
 
@@ -249,6 +258,63 @@ class SqliteSaver:
                 "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
             ).fetchall()
         return [r[0] for r in rows]
+
+    def get_delta_channel_history(self, thread_id: str, channels: list[str],
+                                  checkpoint_id: str | None = None
+                                  ) -> dict[str, dict[str, Any]]:
+        """
+        沿 thread 的 checkpoint 链往回走，取出每个 delta 通道的
+        「种子 + 增量写入」。语义与 InMemorySaver 的同名方法一致。
+
+        走法见 InMemorySaver.get_delta_channel_history 的 docstring：
+        每个通道在**最近一个存过值的祖先**处停下，那份值就是 seed；
+        seed 之后积累的写入就是 writes。
+        """
+        if not channels:
+            return {}
+        history = self.list(thread_id)
+        if checkpoint_id is not None:
+            for i, ckpt in enumerate(history):
+                if ckpt.id == checkpoint_id:
+                    history = history[: i + 1]
+                    break
+
+        seed_by_ch: dict[str, Any] = {}
+        writes_by_ch: dict[str, list[Any]] = {c: [] for c in channels}
+        remaining = set(channels)
+
+        # 先按新->旧收集 checkpoint，最后统一按旧->新展开写入 ——
+        # 一个 checkpoint 里同一通道可能有多条写入，它们之间的顺序有意义。
+        #
+        # 关键：**找到种子的那份 checkpoint 不参与重放**。
+        # 种子值 = 那个时刻的完整状态，已经包含了它（以及更早祖先）的写入；
+        # 再重放一遍就重复了（计数器这种不幂等的 reducer 会直接算错）。
+        collected = []
+        for ckpt in reversed(history):
+            found_seed_here = False
+            for ch in list(remaining):
+                if ch in ckpt.channel_values:
+                    seed_by_ch[ch] = ckpt.channel_values[ch]
+                    remaining.discard(ch)
+                    found_seed_here = True
+            if found_seed_here:
+                continue
+            if not remaining:
+                break
+            collected.append(ckpt)
+
+        for ckpt in reversed(collected):
+            for chan, val in ckpt.pending_writes:
+                if chan in writes_by_ch:
+                    writes_by_ch[chan].append(val)
+
+        result: dict[str, dict[str, Any]] = {}
+        for ch in channels:
+            entry: dict[str, Any] = {"writes": writes_by_ch[ch]}
+            if ch in seed_by_ch:
+                entry["seed"] = seed_by_ch[ch]
+            result[ch] = entry
+        return result
 
     def delete_thread(self, thread_id: str) -> None:
         """删掉一个 thread 的全部 checkpoint。"""

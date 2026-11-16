@@ -267,6 +267,48 @@ def test_recursion_limit():
         g.compile().invoke({"a": 0}, {"recursion_limit": 5})
 
 
+def test_recursion_limit_is_per_invocation():
+    """
+    recursion_limit 数的是**本次调用**走了几步，不是 thread 累计走了几步。
+
+    之前数的是累计步号，于是同一个 thread 反复调用时步号一直加，
+    跑够 50 步之后每次调用都立刻撞上限、一个节点都跑不了 ——
+    看起来像"历史不累积"，其实是根本没跑起来。
+    """
+    class S(State):
+        n: Annotated[int, operator.add]
+
+    g = StateGraph(S)
+    g.add_node("a", lambda s: {"n": 1})
+    g.add_edge(START, "a")
+    g.add_edge("a", END)
+    app = g.compile(checkpointer=InMemorySaver())
+    cfg = {"thread_id": "t"}
+
+    # 每轮 1 步，跑 20 轮 —— 累计 20 步
+    for _ in range(20):
+        app.invoke({"n": 0}, cfg)
+    assert app.get_state(cfg).values["n"] == 20
+
+    # 再跑一轮：本次只走 1 步，不该因为"累计步号"而撞上限
+    app.invoke({"n": 0}, cfg)
+    assert app.get_state(cfg).values["n"] == 21
+
+
+def test_recursion_limit_still_guards_a_single_invocation():
+    """单次调用内部的死循环照样要被抓到。"""
+    class S(State):
+        a: int
+
+    g = StateGraph(S)
+    g.add_node("n", lambda s: {"a": s["a"] + 1})
+    g.add_edge(START, "n")
+    g.add_edge("n", "n")
+    with pytest.raises(RuntimeError, match="recursion_limit"):
+        g.compile(checkpointer=InMemorySaver()).invoke(
+            {"a": 0}, {"thread_id": "t", "recursion_limit": 5})
+
+
 def test_retry_policy():
     class S(State):
         ok: bool

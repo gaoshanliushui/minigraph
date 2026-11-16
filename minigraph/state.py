@@ -15,11 +15,13 @@ from __future__ import annotations
 import sys
 from typing import Any, Mapping
 
-from .constants import MISSING, Reducer
+from .channels import BatchReducer, DeltaChannel
+from .constants import LAST_VALUE, MISSING, Reducer
 
-
-# 默认 reducer：last-write-wins
-LAST_VALUE: Reducer = lambda old, new: new
+__all__ = [
+    "LAST_VALUE", "State", "add_messages", "merge_dict",
+    "DeltaChannel", "BatchReducer",
+]
 
 
 # 消息列表 reducer：按 id 追加/更新，语义对齐 langgraph 的 add_messages。
@@ -96,14 +98,20 @@ class State(dict):
     # 而不是 KeyError。没有类型就没法造初值 -> 退化成 MISSING。
     field_types: dict[str, Any] = {}
 
+    # 显式声明的通道（目前只有 DeltaChannel）。字段在这里 = 用这个通道，
+    # 不在这里 = 走 channel_for_field 的默认逻辑。
+    channels: dict[str, Any] = {}
+
     "父类在被子类继承的瞬间自动触发**，不是实例化对象的时候调用"
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         reducers: dict[str, Reducer] = {}
         field_types: dict[str, Any] = {}
+        channels: dict[str, Any] = {}
         for base in reversed(cls.__mro__[1:]):
             reducers.update(getattr(base, "reducers", {}))
             field_types.update(getattr(base, "field_types", {}))
+            channels.update(getattr(base, "channels", {}))
         # 注意：这里读 cls.__annotations__，不是 cls.__dict__["__annotations__"]。
         # Python 3.14 起 (PEP 649) 注解变成惰性求值，类字典里不再有
         # "__annotations__" 这一项 —— 用 __dict__ 取会拿到 None，于是 reducer
@@ -112,10 +120,18 @@ class State(dict):
         for name, ann in _own_annotations(cls).items():
             if name.startswith("_") or name == "reducers":
                 continue
+            # DeltaChannel 走单独一条路：它自带 reducer，声明方式也不同。
+            delta = _extract_delta_channel(ann)
+            if delta is not None:
+                channels[name] = delta
+                reducers[name] = delta.reducer
+                field_types[name] = _extract_type(ann)
+                continue
             reducers[name] = _extract_reducer(ann) or LAST_VALUE
             field_types[name] = _extract_type(ann)
         cls.reducers = reducers
         cls.field_types = field_types
+        cls.channels = channels
 
     @classmethod
     def schema(cls) -> dict[str, Reducer]:
@@ -125,6 +141,16 @@ class State(dict):
     def types(cls) -> dict[str, Any]:
         """每个字段的类型，用来给通道算初值。"""
         return dict(cls.field_types)
+
+    @classmethod
+    def channel_specs(cls) -> dict[str, Any]:
+        """
+        显式声明的通道（目前只有 DeltaChannel）。
+
+        字段没出现在这里 = 用默认的 channel_for_field 造通道。
+        出现的字段 = 直接用这个通道对象当它的通道（key 会被改写成字段名）。
+        """
+        return dict(cls.channels)
 
 
 # 取一个类**自己**声明的注解，并把字符串注解解析回真实类型。
@@ -188,6 +214,30 @@ def _extract_reducer(ann) -> Reducer | None:
     return None
 
 
+# 从 `Annotated[T, ...]` 中取出 DeltaChannel。
+#
+# 什么时候调用：
+#   State.__init_subclass__ 遍历每条字段注解时调用。
+#
+# 声明方式有两种：
+#   Annotated[list, DeltaChannel(add_messages)]        —— 通道自带 reducer
+#   Annotated[list, DeltaChannel(add_messages, list)]  —— 显式给类型
+#
+# 为什么单独一条路：
+#   DeltaChannel 不是"reducer"，它是**整个通道对象**。它自带 reducer、
+#   自带快照频率，编译期要拿它当通道用，而不是拿它当 reducer 用。
+#   混在 _extract_reducer 里会把通道当 reducer 传给 channel_for_field，
+#   然后造出一个错的 BinaryOperatorAggregate。
+def _extract_delta_channel(ann) -> Any:
+    meta = getattr(ann, "__metadata__", None)
+    if not meta:
+        return None
+    for item in meta:
+        if isinstance(item, DeltaChannel):
+            return item
+    return None
+
+
 def _extract_type(ann) -> Any:
     """
     从 `Annotated[T, ...]` 里取出 T（没有 Annotated 时，注解本身就是类型）。
@@ -238,4 +288,19 @@ def _schema_types(obj: Mapping[str, Reducer] | type[State] | None) -> dict[str, 
         return {}
     if isinstance(obj, type) and issubclass(obj, State):
         return obj.types()
+    return {}
+
+
+def _schema_channels(obj: Mapping[str, Reducer] | type[State] | None) -> dict[str, Any]:
+    """
+    取显式声明的通道（目前只有 DeltaChannel）。
+
+    和 `_schema` / `_schema_types` 一样，只有 State 子类带得走 ——
+    裸 dict 形态（`{field: reducer}`）只能表达"字段 -> reducer"，
+    表达不了"字段 -> 整个通道对象"。
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, type) and issubclass(obj, State):
+        return obj.channel_specs()
     return {}

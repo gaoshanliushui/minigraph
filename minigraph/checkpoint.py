@@ -79,6 +79,19 @@ class Checkpoint:
     # 触发条件：channel_versions[chan] > versions_seen[node][chan]。
     versions_seen: dict[str, dict[str, int]] = field(default_factory=dict)
 
+    # ---- DeltaChannel 的写入日志 -------------------------------------
+    #
+    # 这一步里各个通道收到的**增量写入**，按 (通道, 值) 记。
+    # 只给 DeltaChannel 用：它的值不进 checkpoint，靠重放这些增量重建。
+    #
+    # 形状是 list[(channel, value)]，同一超步内多个节点写同一通道就
+    # 有多条（顺序 = 节点执行顺序）。
+    pending_writes: list[tuple[str, Any]] = field(default_factory=list)
+
+    # DeltaChannel 的快照节奏计数器：通道名 -> (写入次数, 距上次快照的超步数)。
+    # 满足任一阈值就落一份完整快照（见 channels.DeltaChannel 的说明）。
+    delta_counters: dict[str, tuple[int, int]] = field(default_factory=dict)
+
     def copy(self) -> "Checkpoint":
         import copy as _c
 
@@ -92,6 +105,8 @@ class Checkpoint:
             channel_values=_c.deepcopy(self.channel_values),
             channel_versions=_c.deepcopy(self.channel_versions),
             versions_seen=_c.deepcopy(self.versions_seen),
+            pending_writes=_c.deepcopy(self.pending_writes),
+            delta_counters=_c.deepcopy(self.delta_counters),
         )
 
 
@@ -123,3 +138,78 @@ class InMemorySaver:
             if ckpt.id == checkpoint_id:
                 return ckpt
         raise KeyError(f"thread {thread_id} 下找不到 checkpoint {checkpoint_id}")
+
+    def get_delta_channel_history(self, thread_id: str, channels: list[str],
+                                  checkpoint_id: str | None = None
+                                  ) -> dict[str, dict[str, Any]]:
+        """
+        沿 thread 的 checkpoint 链往回走，取出每个 delta 通道的
+        「种子 + 增量写入」。
+
+        返回：{通道名: {"seed": 种子值(可缺省), "writes": [增量, ...]}}
+
+        走法（对齐 LangGraph 的 get_delta_channel_history）：
+          从目标 checkpoint 往前找，每个通道在**最近一个存过值的祖先**
+          处停下 —— 那份值就是 seed；seed 之后积累的写入就是 writes。
+          走到底还没找到 seed -> 这个通道从空开始（seed 缺省）。
+
+        为什么这样能省空间：
+          有了 seed，之前的祖先就不用再看了；而 seed 每隔一段时间
+          就重新落一份，重放深度因此有上限。
+        """
+        if not channels:
+            return {}
+        history = self.list(thread_id)
+        if checkpoint_id is not None:
+            for i, ckpt in enumerate(history):
+                if ckpt.id == checkpoint_id:
+                    history = history[: i + 1]
+                    break
+
+        # 从新到旧扫。seed_by_ch 存找到的种子，writes_by_ch 累积增量。
+        # 找到 seed 之后就不再往更早的祖先走（但要继续为**别的**通道走）。
+        seed_by_ch: dict[str, Any] = {}
+        writes_by_ch: dict[str, list[Any]] = {c: [] for c in channels}
+        remaining = set(channels)
+
+        # 先把"要重放的 checkpoint"从新到旧收集起来。
+        #
+        # 为什么先收集再展开：一个 checkpoint 里同一个通道可能有**多条**
+        # 写入（并行分支各写一条），它们之间的先后顺序有意义（reducer
+        # 可能对顺序敏感）。边走边 insert(0) 会把这一步内部的顺序打乱，
+        # 所以这里按 checkpoint 收集，最后再统一按旧->新展开。
+        #
+        # 关键：**找到种子的那份 checkpoint 不参与重放**。
+        # 种子值 = 那个时刻的完整状态，已经包含了它自己的写入；
+        # 再重放一遍就重复了（计数器这种不幂等的 reducer 会直接算错）。
+        collected: list[Checkpoint] = []
+        for ckpt in reversed(history):
+            found_seed_here = False
+            for ch in list(remaining):
+                if ch in ckpt.channel_values:
+                    seed_by_ch[ch] = ckpt.channel_values[ch]
+                    remaining.discard(ch)
+                    found_seed_here = True
+            if found_seed_here:
+                # 这一份是种子（或含某个通道的种子）——
+                # 它自己的写入已经在种子值里了，不参与重放。
+                # 更早的祖先同理：种子值已经包含了它们。
+                continue
+            if not remaining:
+                # 所有通道都找到种子了，再往前的祖先不用看了。
+                break
+            collected.append(ckpt)
+
+        # 从旧到新展开写入（collected 是新->旧，所以倒着遍历）
+        for ckpt in reversed(collected):
+            for chan, val in ckpt.pending_writes:
+                if chan in writes_by_ch:
+                    writes_by_ch[chan].append(val)
+
+        result: dict[str, dict[str, Any]] = {}
+        for ch in channels:
+            entry: dict[str, Any] = {"writes": writes_by_ch[ch]}
+            if ch in seed_by_ch:
+                entry["seed"] = seed_by_ch[ch]
+            result[ch] = entry
+        return result

@@ -39,8 +39,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable, Sequence
 
-from .constants import MISSING, Reducer
-from .state import LAST_VALUE
+from .constants import LAST_VALUE, MISSING, Reducer
 
 
 class EmptyChannelError(Exception):
@@ -241,6 +240,218 @@ class BinaryOperatorAggregate(BaseChannel):
         if checkpoint is not MISSING:
             empty.value = checkpoint
         return empty
+
+
+class DeltaChannel(BaseChannel):
+    """
+    只在 checkpoint 里存一个哨兵，状态靠**重放祖先写入**重建。
+
+    这是 LangGraph 里的 `DeltaChannel`（对齐 langgraph/channels/delta.py）。
+    它解决的是"messages 越长，checkpoint 越大"的问题：
+
+      普通通道（BinaryOperatorAggregate）
+        每份 checkpoint 都**完整存一遍**累积后的值。
+        100 轮对话 -> 100 份 checkpoint，每份都存全部消息 -> O(n²)。
+
+      DeltaChannel
+        每份 checkpoint 只存"这一段增量写了什么"，状态是
+        「最近的快照 + 之后的增量重放」。
+
+    ## 代价：reducer 必须满足"分结合并不变性"
+
+        reducer(reducer(state, xs), ys) == reducer(state, xs + ys)
+
+    因为重放时一批增量可能被合并成更大的批次（LangGraph 的
+    `replay_writes` 就是一次调用传一批），如果 reducer 不满足这个性质，
+    重放出来的值和原始运行不一致。
+
+    `add_messages` 满足吗？满足——它按 id 追加/更新，与批次划分无关。
+    `operator.add` 满足。**追加 list 的自定义 reducer 也满足**。
+
+    ## 两个计数器决定何时落快照
+
+      updates     这个通道被写了几次（写才 +1）
+      supersteps  距上次快照过了几个超步（不管写没写都 +1）
+
+    满足任一条件就落一份完整快照：
+      updates >= snapshot_frequency
+      supersteps >= DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT
+
+    第二个上界很重要：某个通道可能很久不再被写，光靠 updates 会让
+    重放深度无限增长。
+    """
+
+    __slots__ = ("value", "reducer", "typ", "snapshot_frequency")
+
+    def __init__(self, reducer: Reducer | None = None, typ: Any = None, *,
+                 snapshot_frequency: int = 1000):
+        """
+        `reducer` —— 合并规则。两种都接受：
+          - 二元 reducer `(old, new) -> merged`（add_messages / operator.add）
+          - 批量 reducer `(state, list[writes]) -> new_state`（BatchReducer）
+
+        `typ` —— 值的类型，用来算零值初值（list->[]）。拿不到就当 list。
+
+        签名刻意对齐 LangGraph 的 `DeltaChannel(reducer, typ, *,
+        snapshot_frequency=1000)`。
+        """
+        if snapshot_frequency <= 0:
+            raise ValueError(
+                f"snapshot_frequency 必须是正整数，收到 {snapshot_frequency}"
+            )
+        self.key = ""
+        self.reducer = reducer
+        self.snapshot_frequency = snapshot_frequency
+        self.typ = typ if typ is not None else list
+        self.value: Any = MISSING
+
+    # -- 读 ---------------------------------------------------------------
+    def get(self) -> Any:
+        if self.value is MISSING:
+            raise EmptyChannelError()
+        return self.value
+
+    def is_available(self) -> bool:
+        return self.value is not MISSING
+
+    def copy(self) -> "DeltaChannel":
+        new = self.__class__(self.reducer, self.typ,
+                             snapshot_frequency=self.snapshot_frequency)
+        new.key = self.key
+        new.value = self.value
+        return new
+
+    # -- 写 ---------------------------------------------------------------
+    def update(self, values: Sequence[Any]) -> bool:
+        """
+        把这一批写入合并进当前值。
+
+        与 BinaryOperatorAggregate 的区别：这里**一次 reducer 调用**处理
+        整批，而不是逐条。LangGraph 的 DeltaChannel reducer 签名是
+        `(state, list[writes]) -> new_state`。
+
+        但 minigraph 现有的 reducer 签名是**二元**的 `(old, new) -> merged`。
+        为了兼容两套签名，这里做一层适配：
+
+          - reducer 是"二元 reducer"（比如 add_messages / operator.add）
+            -> 逐条调用：reducer(reducer(state, v1), v2) ...
+          - reducer 是"批量 reducer"（自己接受 list）
+            -> 一次调用：reducer(state, values)
+
+        怎么区分？批量 reducer 是用 `DeltaChannel` 显式构造时传进来的，
+        而 State 注解里写的是二元 reducer。两种都支持，靠 arity 判断太脆
+        （内置函数 arity 不可靠），所以这里约定：
+        **批量 reducer 必须是 `BatchReducer` 的实例**，二元 reducer 是普通
+        callable。
+        """
+        if not values:
+            return False
+        base = self.typ() if self.value is MISSING else self.value
+        if isinstance(self.reducer, BatchReducer):
+            self.value = self.reducer.apply(base, list(values))
+        else:
+            for v in values:
+                self.value = self.reducer(base, v)
+                base = self.value
+        return True
+
+    # -- 重放（从 checkpoint 恢复） ---------------------------------------
+    def replay_writes(self, writes: Sequence[Any]) -> None:
+        """
+        把祖先的写入按从旧到新的顺序重放一遍，重建当前值。
+
+        `writes` 是这一段（最近快照之后）积累的写入值，已按时间排好序。
+        分批调用 `update` —— 每批一次 reducer 调用，和原运行一致。
+        """
+        if not writes:
+            return
+        base = self.value
+        if isinstance(self.reducer, BatchReducer):
+            if base is MISSING:
+                base = self.typ()
+            self.value = self.reducer.apply(base, list(writes))
+        else:
+            for v in writes:
+                if base is MISSING:
+                    base = self.typ()
+                base = self.reducer(base, v)
+            self.value = base
+
+    # -- 持久化 -----------------------------------------------------------
+    def checkpoint(self) -> Any:
+        """
+        永远返回 MISSING —— checkpoint 里**不存**这个通道的值。
+
+        真正的快照由 runtime 决定时机，直接把 `_DeltaSnapshot(ch.get())`
+        写进 channel_values；非快照步则这个通道根本不出现，
+        恢复时靠重放祖先写入重建。
+        """
+        return MISSING
+
+    def from_checkpoint(self, checkpoint: Any) -> "DeltaChannel":
+        """
+        从 checkpoint 恢复。
+
+        三种 blob：
+          MISSING            -> 空（调用方接着重放写入）
+          _DeltaSnapshot     -> 直接用快照里的值
+          普通值             -> 老版本 BinaryOperatorAggregate 迁移过来的
+        """
+        new = self.__class__(self.reducer, self.typ,
+                             snapshot_frequency=self.snapshot_frequency)
+        new.key = self.key
+        if isinstance(checkpoint, DeltaSnapshot):
+            new.value = checkpoint.value
+        elif checkpoint is not MISSING:
+            new.value = checkpoint
+        else:
+            new.value = self.typ()
+        return new
+
+
+class BatchReducer:
+    """
+    标记一个"批量 reducer"：签名是 `(state, list[writes]) -> new_state`。
+
+    minigraph 现有的 reducer 是二元的 `(old, new) -> merged`。
+    DeltaChannel 两种都支持，用这个类做区分 —— 靠 arity 判断不可靠
+    （内置函数的 arity 看不了），用一个显式的标记类最稳。
+
+    对齐 LangGraph：它的 DeltaChannel reducer **就是**批量的，
+    而 BinaryOperatorAggregate 的 reducer 是二元的。
+    """
+
+    __slots__ = ("fn",)
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def apply(self, state: Any, values: list[Any]) -> Any:
+        return self.fn(state, values)
+
+    def __call__(self, state: Any, values: list[Any]) -> Any:
+        return self.fn(state, values)
+
+
+class DeltaSnapshot:
+    """
+    checkpoint 里存的一份完整快照。
+
+    语义对齐 LangGraph 的 `_DeltaSnapshot`（langgraph/checkpoint/serde/types.py）：
+    它是"祖先重放的终点"——重放走到这个 blob 就停，状态从快照直接恢复，
+    不用再往更早的祖先走。
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any):
+        self.value = value
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<DeltaSnapshot {type(self.value).__name__}>"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, DeltaSnapshot) and other.value == self.value
 
 
 class EphemeralValue(BaseChannel):

@@ -56,10 +56,20 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 from .channels import (
     BaseChannel,
     ConcurrentWriteError,
+    DeltaChannel,
+    DeltaSnapshot,
     channel_for_field,
 )
 from .checkpoint import Checkpoint, InMemorySaver
-from .constants import BRANCH_TO, END, MISSING, Reducer, START, TASKS
+from .constants import (
+    BRANCH_TO,
+    DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT,
+    END,
+    MISSING,
+    Reducer,
+    START,
+    TASKS,
+)
 from .context import GraphInterrupt, _ctx
 from .control import Command, Send
 from .state import State
@@ -106,7 +116,13 @@ class _RuntimeState:
     updated   上一步变了的通道；下一轮算触发时只看它们的订阅者
               （None = 不做增量优化，全量扫描所有节点）
     extra     未声明的输入键（只读，不许写）
-    step      当前超步号
+    step      当前超步号（**累计**的：跨运行一直往上加，是 checkpoint 的编号）
+    run_step  本次运行已经走了几步（**单次**的：recursion_limit 数的是它）
+    delta_ct  delta 通道的快照节奏计数器：通道名 -> (写入次数, 超步数)
+    inp_wr    本次运行的**输入**带来的写入：[(通道, 值)]。
+              它是第 0 步的写入，要并进第一份 checkpoint 的 pending_writes，
+              否则 delta 通道重建时这段输入就丢了（对齐 LangGraph：graph
+              input 也进 checkpoint_writes）。
     """
 
     nodes: dict[str, NodeSpec]
@@ -117,6 +133,9 @@ class _RuntimeState:
     extra: dict[str, Any] = field(default_factory=dict)
     updated: set[str] | None = None
     step: int = 0
+    run_step: int = 0
+    delta_counters: dict[str, tuple[int, int]] = field(default_factory=dict)
+    input_writes: list[tuple[str, Any]] = field(default_factory=list)
 
     # -- 读 ---------------------------------------------------------------
     def read(self) -> dict:
@@ -126,6 +145,26 @@ class _RuntimeState:
     def projection(self) -> dict:
         """扁平状态字典（给 get_state / checkpoint.values 用）。"""
         return _state_projection(self.channels, self.reducers, self.extra)
+
+    def projection_without_delta(self) -> dict:
+        """
+        扁平状态字典，但**不含 delta 通道**的字段。
+
+        给存 checkpoint 用：delta 通道的值已经由「种子 + 增量写入」表达了，
+        再在 values 里存一遍完整值 = 白白多占一份空间（而且是最大那份）。
+
+        读回来时这些字段由 _restore_channels 重建（见 _replay_delta_channels），
+        所以 get_state 拿到的还是完整状态。
+        """
+        out = {}
+        for f in self.reducers:
+            ch = self.channels.get(f)
+            if isinstance(ch, DeltaChannel):
+                continue
+            if ch is not None and ch.is_available():
+                out[f] = ch.get()
+        out.update(self.extra)
+        return out
 
     def next_version(self) -> int:
         """全局版本计数器：所有通道共用一个递增序列（对齐 LangGraph）。"""
@@ -351,12 +390,45 @@ class CompiledGraph:
         snap = self.checkpointer.get(thread_id, config.get("checkpoint_id"))
         if snap is None:
             raise ValueError(f"thread {thread_id} 还没有 checkpoint")
+        # 拷贝一份再补 —— InMemorySaver 是按引用存的，
+        # 直接改原对象会把存下去的那份也改了（存的时候是特意不含 delta 字段的）。
+        snap = snap.copy()
+        self._fill_delta_values(snap, thread_id)
         return snap
 
     def get_state_history(self, config: dict) -> list[Checkpoint]:
         if not self.checkpointer:
             raise ValueError("未配置 checkpointer")
-        return list(self.checkpointer.list(config["thread_id"]))
+        thread_id = config["thread_id"]
+        history = [snap.copy() for snap in self.checkpointer.list(thread_id)]
+        for snap in history:
+            self._fill_delta_values(snap, thread_id)
+        return history
+
+    def _fill_delta_values(self, snap: Checkpoint, thread_id: str) -> None:
+        """
+        把 delta 通道的值补回 snapshot.values。
+
+        为什么需要：delta 通道的值**不存**在 checkpoint 里（它在
+        「种子 + 增量写入」里），所以存下来的 values 是缺这些字段的。
+        用户通过 get_state() 看到的应该是**完整**状态，所以这里现算一份
+        补上。
+
+        代价：每份历史快照都要重放一次。只在 get_state* 里做，
+        运行时内部走的是 _restore_channels（只重放一次）。
+        """
+        delta_channels = [c for c, ch in self.channels.items()
+                          if isinstance(ch, DeltaChannel)]
+        if not delta_channels:
+            return
+        missing = [c for c in delta_channels if c not in snap.values]
+        if not missing:
+            return
+        channels, _, _ = self._restore_channels(snap, thread_id)
+        for c in missing:
+            ch = channels.get(c)
+            if ch is not None and ch.is_available():
+                snap.values[c] = ch.get()
 
     def update_state(self, config: dict, values: dict, as_node: str | None = None) -> str:
         """
@@ -391,7 +463,7 @@ class CompiledGraph:
         else:
             snap = snap.copy()
 
-        channels, versions, seen = self._restore_channels(snap)
+        channels, versions, seen = self._restore_channels(snap, thread_id)
         extra_values = {k: v for k, v in snap.values.items() if k not in self.reducers}
         # ① 把 values 写进状态通道
         _write_state_channels(self.reducers, channels, values,
@@ -436,12 +508,36 @@ class CompiledGraph:
         snap.interrupt = None
         snap.interrupts = []
         snap.resumes = {}
-        snap.values = _state_projection(channels, self.reducers, extra_values)
-        snap.channel_values = {c: ch.checkpoint() for c, ch in channels.items()}
+
+        # delta 通道的值不进 values —— 它由「种子 + 增量写入」表达。
+        # 这次 update_state 的写入要记进 pending_writes（它是新的一段增量），
+        # 否则恢复时这段改动就丢了。
+        rt.input_writes = [(k, v) for k, v in values.items() if k in self.reducers]
+        snap.values = rt.projection_without_delta()
+
+        channel_values = {c: ch.checkpoint() for c, ch in channels.items()}
+        # delta 通道：这次被 update_state 写了的，落一份快照；
+        # 没写的，值还停留在上一份 checkpoint 的位置 —— 靠 pending_writes
+        # 链回去就行，不用在这里存。
+        for chan, ch in channels.items():
+            if not isinstance(ch, DeltaChannel):
+                continue
+            if chan in rt.input_writes:
+                channel_values[chan] = DeltaSnapshot(ch.get())
+            else:
+                channel_values.pop(chan, None)
+
+        snap.channel_values = channel_values
         snap.channel_versions = dict(versions)
         snap.versions_seen = {k: dict(v) for k, v in seen.items()}
         snap.next = tuple(t.name for t in upcoming)
         snap.tasks = [t.send if t.is_push else t.name for t in upcoming]
+        snap.pending_writes = list(rt.input_writes)
+        # 落过快照的通道，计数器归零
+        counters = dict(snap.delta_counters or {})
+        for chan, _ in rt.input_writes:
+            counters[chan] = (0, 0)
+        snap.delta_counters = counters
         self.checkpointer.put(thread_id, snap)
         return snap.id
 
@@ -471,7 +567,7 @@ class CompiledGraph:
         return None
 
     # -- 通道状态的恢复 -----------------------------------------------------
-    def _restore_channels(self, snap: Checkpoint):
+    def _restore_channels(self, snap: Checkpoint, thread_id: str | None = None):
         """
         从 checkpoint 重建运行期的通道状态。
 
@@ -479,19 +575,81 @@ class CompiledGraph:
           - 值   存在 channel_values 里
           - 版本  存在 channel_versions 里（单调递增，触发靠它）
           - 水位  存在 versions_seen 里（每个节点各存一份）
+
+        DeltaChannel 是个例外：它的值**不在** channel_values 里
+        （checkpoint 只存哨兵），要靠祖先链上的「种子 + 增量写入」重放重建。
         """
         channels = {c: ch.copy() for c, ch in self.channels.items()}
+
+        # 普通通道：从 channel_values 直接恢复
         for chan, val in (snap.channel_values or {}).items():
             ch = channels.get(chan)
             if ch is None:
                 continue
             channels[chan] = ch.from_checkpoint(val)
 
+        # DeltaChannel：放在**之后**重建 ——
+        # 它的值不在 channel_values 里（只有快照时才有），得靠祖先重放。
+        # 放前面会被上面那个循环用 MISSING 覆盖掉。
+        delta_channels = [c for c, ch in channels.items()
+                          if isinstance(ch, DeltaChannel)]
+        if delta_channels:
+            self._replay_delta_channels(channels, snap, delta_channels,
+                                        thread_id)
+
         versions = {c: 0 for c in channels}
         versions.update(snap.channel_versions or {})
 
         seen = {k: dict(v) for k, v in (snap.versions_seen or {}).items()}
         return channels, versions, seen
+
+    def _replay_delta_channels(self, channels: dict[str, BaseChannel],
+                               snap: Checkpoint, delta_channels: list[str],
+                               thread_id: str | None) -> None:
+        """
+        用「种子 + 增量写入」重建 delta 通道的值。
+
+        走法（对齐 LangGraph 的 channels_from_checkpoint）：
+          1. 找最近一个存过这个通道的祖先 —— 那份值是**种子**
+          2. 种子之后积累的写入按旧->新重放
+          3. 如果目标 checkpoint 自己存了快照（DeltaSnapshot），直接用它
+
+        为什么需要 step 3：落快照的那一步，通道的完整值已经写进
+        checkpoint 了，重放反而绕远路。
+        """
+        # 目标 checkpoint 自己存了快照 -> 直接用，最省事。
+        need_replay = []
+        for chan in delta_channels:
+            blob = (snap.channel_values or {}).get(chan)
+            if isinstance(blob, DeltaSnapshot):
+                channels[chan] = channels[chan].from_checkpoint(blob)
+            elif chan not in (snap.channel_values or {}):
+                # 没存值 -> 必须靠祖先重放
+                need_replay.append(chan)
+            else:
+                # 存了普通值（老版本 BinaryOperatorAggregate 迁移过来的）
+                channels[chan] = channels[chan].from_checkpoint(blob)
+
+        if not need_replay:
+            return
+        if not self.checkpointer or not thread_id:
+            raise ValueError(
+                f"delta 通道 {need_replay} 需要靠祖先写入重建，"
+                f"但没有 checkpointer 或 thread_id"
+            )
+        histories = self.checkpointer.get_delta_channel_history(
+            thread_id, need_replay, snap.id)
+
+        for chan in need_replay:
+            entry = histories.get(chan) or {}
+            ch = channels[chan]
+            # 种子：找到了就从它开始，没找到就从头（空）开始
+            seed = entry.get("seed", MISSING)
+            ch = ch.from_checkpoint(seed if seed is not MISSING else MISSING)
+            writes = entry.get("writes") or []
+            if writes:
+                ch.replay_writes(writes)
+            channels[chan] = ch
 
     # -- 开场：全新运行 or 从 checkpoint 恢复 ------------------------------
     def _begin(self, input: State | None, snap: Checkpoint | None,
@@ -506,10 +664,11 @@ class CompiledGraph:
         has_resume = "resume" in cfg
         resume_val = cfg.get("resume")
         debug = cfg.get("debug", False)
+        thread_id = cfg.get("thread_id")
 
         if snap is not None:
             # ---------- 从 checkpoint 恢复（可能还带新输入）----------
-            channels, versions, seen = self._restore_channels(snap)
+            channels, versions, seen = self._restore_channels(snap, thread_id)
             extra_values = {
                 k: v for k, v in snap.values.items() if k not in reducers
             }
@@ -528,10 +687,19 @@ class CompiledGraph:
                 extra_values.update(
                     {k: v for k, v in raw.items() if k not in reducers}
                 )
+                # 输入的写入也要进 pending_writes —— 它是"第 0 步"的写入，
+                # 不记下来的话 delta 通道重建时这段输入就凭空丢了。
+                input_writes = [(k, v) for k, v in raw.items()
+                                if k in reducers]
+            else:
+                input_writes = []
             rt = _RuntimeState(
                 nodes=self.nodes, reducers=reducers,
                 channels=channels, versions=versions, seen=seen,
                 extra=extra_values, updated=None, step=snap.step,
+                delta_counters={k: tuple(v) for k, v in
+                                (snap.delta_counters or {}).items()},
+                input_writes=input_writes,
             )
             # checkpoint 目前不保存 updated_channels；恢复后的第一轮检查
             # 所有节点，之后仍走 changed-channel 反向索引。
@@ -596,6 +764,7 @@ class CompiledGraph:
             nodes=self.nodes, reducers=reducers,
             channels=channels, versions=versions, seen={},
             extra=extra_values, updated=set(), step=0,
+            input_writes=[(k, v) for k, v in raw.items() if k in reducers],
         )
         _ctx()["resume"] = {}
         if debug:
@@ -638,7 +807,16 @@ class CompiledGraph:
                 break
             # 只有"还有任务要跑"才消耗步数预算。图恰好在第 limit 步结束
             # 是正常完成，不应在下一轮发现没有任务前被误判为死循环。
-            if rt.step >= limit:
+            #
+            # 数的是 **run_step**（本次运行走了几步），不是 rt.step
+            # （thread 累计走了几步）。recursion_limit 是"单次调用的
+            # 预算"——对齐真实 LangGraph：它的 recursion_limit 也是每次
+            # invoke 重新算的。
+            #
+            # 之前数的是累计步号，于是同一个 thread 反复调用时，步号一直
+            # 往上加，跑够 50 步之后**每一次**调用都立刻撞上限，
+            # 一个节点都跑不了 —— 看起来像"历史不累积"，其实是根本没跑起来。
+            if rt.run_step >= limit:
                 raise RuntimeError(f"超过 recursion_limit={limit}，疑似死循环")
 
             if debug:
@@ -669,7 +847,8 @@ class CompiledGraph:
             # ⑤⑥ 落盘：推水位线、消费屏障、应用写入、清理过期通道
             self._advance(rt, tasks, writes)
 
-            rt.step += 1
+            rt.step += 1        # 累计步号：checkpoint 的编号，跨运行一直加
+            rt.run_step += 1    # 本次运行走了几步：recursion_limit 数的是它
             if debug:
                 print(f"  step {rt.step}: {ran} -> changed={[c for _, c, _ in writes]}")
 
@@ -680,7 +859,16 @@ class CompiledGraph:
             }
 
             if saver and thread_id:
-                self._save(rt, saver, thread_id)
+                # 本步的增量写入：delta 通道靠它重建状态。
+                # 只记数据通道（状态字段），触发通道的写入不参与重放。
+                step_writes = [(c, v) for _, c, v in writes
+                               if c in self.reducers]
+                # 输入的写入算第 0 步 —— 并进**第一份** checkpoint 的
+                # pending_writes，否则 delta 通道重建时输入这段就丢了。
+                if rt.input_writes:
+                    step_writes = list(rt.input_writes) + step_writes
+                    rt.input_writes = []
+                self._save(rt, saver, thread_id, step_writes)
 
         _ctx()["slot"] = None
 
@@ -792,7 +980,7 @@ class CompiledGraph:
         ]
         ckpt = Checkpoint(
             id=saver.new_id() if saver else "ephemeral",
-            step=this_step, values=rt.projection(),
+            step=this_step, values=rt.projection_without_delta(),
             next=tuple(t.name for t in tasks),
             tasks=[t.send if t.is_push else t.name for t in tasks],
             interrupt=records[0] if records else None,
@@ -803,7 +991,21 @@ class CompiledGraph:
             channel_values={c: ch.checkpoint() for c, ch in rt.channels.items()},
             channel_versions=dict(rt.versions),
             versions_seen={k: dict(v) for k, v in rt.seen.items()},
+            # 这一步的写入被整步回滚了，所以 pending_writes 是空的 ——
+            # 恢复时祖先链会找到上一步的那份，状态不会丢。
+            #
+            # **例外**：本次运行的**输入**还没进过任何 checkpoint（第一步就
+            # 挂了），它必须在这里落一次，否则 delta 通道重建时输入这段
+            # 就凭空丢了。
+            pending_writes=list(rt.input_writes),
+            delta_counters=dict(rt.delta_counters),
         )
+        rt.input_writes = []
+        # delta 通道的值不进 channel_values（挂起这一刻的值 = 上一步之后
+        # 的值，祖先链上已经有了）。
+        for chan, ch in rt.channels.items():
+            if isinstance(ch, DeltaChannel):
+                ckpt.channel_values.pop(chan, None)
         if saver and thread_id:
             saver.put(thread_id, ckpt)
         self._last_values = rt.projection()
@@ -811,17 +1013,85 @@ class CompiledGraph:
         self._interrupts = [h.value for h in hits]
 
     # -- 存 checkpoint ------------------------------------------------------
-    def _save(self, rt: _RuntimeState, saver, thread_id: str) -> None:
-        """把本步的结束状态存成 checkpoint（给 get_state / 恢复用）。"""
+    def _save(self, rt: _RuntimeState, saver, thread_id: str,
+              pending_writes: list[tuple[str, Any]] | None = None) -> None:
+        """
+        把本步的结束状态存成 checkpoint（给 get_state / 恢复用）。
+
+        DeltaChannel 的处理（对齐 LangGraph 的 _put_checkpoint）：
+
+          ① 计数器推进
+             每个 delta 通道记 (写入次数, 距上次快照的超步数)。
+             写入次数只在**这个通道被写**时 +1；超步数每步都 +1。
+
+          ② 决定要不要落快照
+             写入次数 >= snapshot_frequency
+             或 超步数 >= DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT
+             满足任一条就落一份完整快照（DeltaSnapshot）。
+
+          ③ 写 checkpoint
+             - 落了快照的通道 -> channel_values[chan] = DeltaSnapshot(值)
+             - 没落快照的通道 -> **不出现**在 channel_values 里
+               （它的值靠祖先链上的增量重放重建）
+             - 本步的增量写入记进 pending_writes，给重放用
+
+          ④ 计数归零
+             落了快照的通道，计数器重置为 (0, 0)。
+        """
         upcoming = self._next_tasks(rt)
+        pending_writes = pending_writes or []
+
+        channel_values = {c: ch.checkpoint() for c, ch in rt.channels.items()}
+        counters = dict(rt.delta_counters)
+        updated = {c for c, _ in pending_writes}
+
+        # ① 计数器推进
+        for chan, ch in rt.channels.items():
+            if not isinstance(ch, DeltaChannel):
+                continue
+            u, s = counters.get(chan, (0, 0))
+            s += 1
+            if chan in updated:
+                u += 1
+            counters[chan] = (u, s)
+
+        # ② 谁该落快照
+        to_snapshot = {
+            chan for chan, ch in rt.channels.items()
+            if isinstance(ch, DeltaChannel)
+            and ch.is_available()
+            and chan in rt.versions
+            and (
+                counters.get(chan, (0, 0))[0] >= ch.snapshot_frequency
+                or counters.get(chan, (0, 0))[1]
+                >= DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT
+            )
+        }
+
+        # ③ 写 checkpoint：delta 通道要么落快照，要么根本不出现
+        for chan in to_snapshot:
+            channel_values[chan] = DeltaSnapshot(rt.channels[chan].get())
+        for chan, ch in rt.channels.items():
+            if isinstance(ch, DeltaChannel) and chan not in to_snapshot:
+                # 没落快照 -> 不存值（省空间），靠重放重建
+                channel_values.pop(chan, None)
+
+        # ④ 计数归零
+        for chan in to_snapshot:
+            counters[chan] = (0, 0)
+
         saver.put(thread_id, Checkpoint(
             id=saver.new_id(), step=rt.step,
-            values=rt.projection(),
+            # delta 通道的值不进 values —— 它由「种子 + 增量写入」表达，
+            # 在这里再存一遍完整值就是最大的那份浪费。
+            values=rt.projection_without_delta(),
             next=tuple(t.name for t in upcoming),
             tasks=[t.send if t.is_push else t.name for t in upcoming],
-            channel_values={c: ch.checkpoint() for c, ch in rt.channels.items()},
+            channel_values=channel_values,
             channel_versions=dict(rt.versions),
             versions_seen={k: dict(v) for k, v in rt.seen.items()},
+            pending_writes=list(pending_writes),
+            delta_counters=counters,
         ))
 
 

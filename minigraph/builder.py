@@ -31,7 +31,7 @@ from .channels import (
     channel_for_field,
 )
 from .constants import BRANCH_TO, END, JOIN, Reducer, START, TASKS
-from .state import State, _schema, _schema_types
+from .state import State, _schema, _schema_channels, _schema_types
 
 if TYPE_CHECKING:  # 运行时真正 import 留给 .compile() 内部
     from .checkpoint import InMemorySaver
@@ -65,6 +65,8 @@ class StateGraph:
         # 字段类型：只用来给 reducer 通道算初值（typ()）。
         # 裸 dict 形态声明的 schema 没有类型 -> 空 dict -> 通道退化成 MISSING。
         self.field_types = _schema_types(state_schema)
+        # 显式声明的通道（DeltaChannel）。字段在这里 = 编译时直接用它当通道。
+        self.channel_specs = _schema_channels(state_schema)
         self.nodes: dict[str, dict[str, Any]] = {}
         self.edges: list[tuple[str, str]] = []
         # 多源汇聚边：add_edge(["a","b"], "c")
@@ -163,8 +165,16 @@ class StateGraph:
 
         # ① 数据通道：每个状态字段一个
         for field, reducer in self.reducers.items():
-            channels[field] = channel_for_field(field, reducer,
-                                                self.field_types.get(field))
+            spec = self.channel_specs.get(field)
+            if spec is not None:
+                # 显式声明的通道（DeltaChannel）：直接用，但要换个 key ——
+                # 通道的 key 是它自己的字段名，声明时可能写的是别的。
+                ch = spec.copy()
+                ch.key = field
+                channels[field] = ch
+            else:
+                channels[field] = channel_for_field(field, reducer,
+                                                    self.field_types.get(field))
 
         # ② 触发通道：每个节点一个 branch:to:X，节点订阅它
         for name in self.nodes:

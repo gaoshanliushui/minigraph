@@ -26,7 +26,7 @@ from minigraph.builder import StateGraph
 from minigraph.checkpoint import InMemorySaver
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.constants import END, START
-from minigraph.state import State, add_messages
+from minigraph.state import DeltaChannel, State, add_messages
 
 # checkpoint 落盘位置跟着**文件**走，而不是跟着当前工作目录 ——
 # 这样 `python examples/01_react_agent.py`（从仓库根跑）和
@@ -45,7 +45,16 @@ TOOLS = {"get_weather": get_weather}
 
 
 class AgentState(State):
-    messages: Annotated[list, add_messages]   # 对话历史，按 id 追加/更新
+    # messages 用 DeltaChannel：checkpoint 里**不存**完整对话历史，
+    # 只存每一步的增量；状态靠「最近快照 + 增量重放」重建。
+    #
+    # 为什么要这样：普通通道每份 checkpoint 都存一遍完整消息列表，
+    # 于是 100 轮对话 -> 100 份全量快照 -> O(n²) 的空间。
+    # DeltaChannel 把它压成 O(n)。
+    #
+    # add_messages 满足 DeltaChannel 的前提（按 id 追加/更新，与批次
+    # 划分无关），所以可以直接用。
+    messages: Annotated[list, DeltaChannel(add_messages, list)]
     steps: Annotated[int, operator.add]       # 循环计数，并发安全
 
 
