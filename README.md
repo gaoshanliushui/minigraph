@@ -331,8 +331,31 @@ class S(State):
     items: Annotated[list, DeltaChannel(BatchReducer(merge), list)]
 ```
 
+**④ 存储结构：写入日志独立成表，祖先链显式化。**
+
+对齐 LangGraph 的 `checkpoints` + `writes` 两表结构：
+
+| 表 | 装什么 |
+| --- | --- |
+| `checkpoints` | 内核状态 blob（`values` / `channel_values` / 版本 / 水位线）+ `parent_checkpoint_id` |
+| `writes` | 每份 checkpoint 当步的增量写入，`(checkpoint_id, idx)` 保序 |
+
+`Checkpoint.pending_writes` 是个**查询视图**：写入时拆进 `writes` 表，
+读出时拼回 —— Checkpoint 对使用者仍是自包含的。
+
+`parent_checkpoint_id` 解决的是**分叉**：`update_state(..., checkpoint_id=...)`
+或 `invoke(..., {"checkpoint_id": ...})` 从历史点分叉后，两条线的 checkpoint
+在存储里交错追加，按写入顺序扫祖先会把**另一条线**的写入也重放进来
+（主线消息串进分叉线）。沿父链走则只有 on-path 祖先参与 —— LangGraph
+原话："walks the parent chain, not `list(before=...)`: for forked threads,
+only on-path ancestors contribute"。
+
+旧格式的库打开时自动迁移：补 parent 列（旧线性历史按 seq 回填）、
+旧 blob 里的 pending_writes 在 writes 表查不到时回退读取，不用搬数据。
+
 实现落在 `minigraph/channels.py`（通道）、`minigraph/runtime.py`（快照节奏与
-重放）、`minigraph/checkpoint.py` 与 `checkpoint_sqlite.py`（祖先链遍历）。
+重放）、`minigraph/checkpoint.py` 与 `checkpoint_sqlite.py`（祖先链遍历、
+两表存储）。
 
 ---
 
@@ -349,6 +372,7 @@ class S(State):
 | checkpoint 历史 | 每个超步存一份 | 额外存「输入」那一份（`step=-1`/`0`） |
 | `DeltaChannel` reducer 签名 | 二元 `(old, new)` 为主，批量用 `BatchReducer` 标记 | 统一批量 `(state, list[writes])` |
 | `DeltaChannel` 的 `Overwrite` 语义 | 不支持（minigraph 没有 `Overwrite` 概念） | 支持，作为重放时的重置点 |
+| `writes` 表的写入顺序键 | `idx`（同一步内按产生顺序） | `writes_sort_key(task_path, task_id, idx)` |
 | `recursion_limit` 的计数范围 | **单次调用**走了多少步 | **单次调用**走了多少步 |
 
 这些差异均有注释或测试标注；其余核心调度行为通过差分场景验证。

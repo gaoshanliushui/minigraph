@@ -136,6 +136,10 @@ class _RuntimeState:
     run_step: int = 0
     delta_counters: dict[str, tuple[int, int]] = field(default_factory=dict)
     input_writes: list[tuple[str, Any]] = field(default_factory=list)
+    # 本次运行最近一次落盘的 checkpoint id。下一份 checkpoint 的
+    # parent_id 就是它 —— 从历史点分叉时，恢复源（而不是存储里最新的
+    # 那份）才是新 checkpoint 的父节点。
+    last_ckpt_id: str | None = None
 
     # -- 读 ---------------------------------------------------------------
     def read(self) -> dict:
@@ -458,9 +462,13 @@ class CompiledGraph:
         if snap is None:
             # LangGraph 允许在还没有快照的 thread 上 update_state：
             # 以空快照为底，这次的 values 就是初始状态。
+            parent_id = None
             snap = Checkpoint(id=self.checkpointer.new_id(), step=-1,
                               values={}, next=(), tasks=[])
         else:
+            # 新 checkpoint 的父节点 = 这次改写的**基点**（可能是个历史点，
+            # 即从它分叉），不是存储里最新的那份。
+            parent_id = snap.id
             snap = snap.copy()
 
         channels, versions, seen = self._restore_channels(snap, thread_id)
@@ -504,6 +512,7 @@ class CompiledGraph:
         upcoming = self._next_tasks(rt)
 
         snap.id = self.checkpointer.new_id()
+        snap.parent_id = parent_id
         snap.step += 1
         snap.interrupt = None
         snap.interrupts = []
@@ -519,10 +528,14 @@ class CompiledGraph:
         # delta 通道：这次被 update_state 写了的，落一份快照；
         # 没写的，值还停留在上一份 checkpoint 的位置 —— 靠 pending_writes
         # 链回去就行，不用在这里存。
+        updated_chans = {c for c, _ in rt.input_writes}
         for chan, ch in channels.items():
             if not isinstance(ch, DeltaChannel):
                 continue
-            if chan in rt.input_writes:
+            # 注意比较的是**通道名集合**：input_writes 是 [(通道, 值)]，
+            # 直接 `chan in rt.input_writes` 永远为 False（字符串比元组），
+            # 会导致这里从不落快照。
+            if chan in updated_chans:
                 channel_values[chan] = DeltaSnapshot(ch.get())
             else:
                 channel_values.pop(chan, None)
@@ -700,6 +713,7 @@ class CompiledGraph:
                 delta_counters={k: tuple(v) for k, v in
                                 (snap.delta_counters or {}).items()},
                 input_writes=input_writes,
+                last_ckpt_id=snap.id,
             )
             # checkpoint 目前不保存 updated_channels；恢复后的第一轮检查
             # 所有节点，之后仍走 changed-channel 反向索引。
@@ -999,6 +1013,7 @@ class CompiledGraph:
             # 就凭空丢了。
             pending_writes=list(rt.input_writes),
             delta_counters=dict(rt.delta_counters),
+            parent_id=rt.last_ckpt_id,
         )
         rt.input_writes = []
         # delta 通道的值不进 channel_values（挂起这一刻的值 = 上一步之后
@@ -1008,6 +1023,7 @@ class CompiledGraph:
                 ckpt.channel_values.pop(chan, None)
         if saver and thread_id:
             saver.put(thread_id, ckpt)
+            rt.last_ckpt_id = ckpt.id
         self._last_values = rt.projection()
         self._interrupted = hits[0].value
         self._interrupts = [h.value for h in hits]
@@ -1080,7 +1096,7 @@ class CompiledGraph:
         for chan in to_snapshot:
             counters[chan] = (0, 0)
 
-        saver.put(thread_id, Checkpoint(
+        ckpt = Checkpoint(
             id=saver.new_id(), step=rt.step,
             # delta 通道的值不进 values —— 它由「种子 + 增量写入」表达，
             # 在这里再存一遍完整值就是最大的那份浪费。
@@ -1092,7 +1108,10 @@ class CompiledGraph:
             versions_seen={k: dict(v) for k, v in rt.seen.items()},
             pending_writes=list(pending_writes),
             delta_counters=counters,
-        ))
+            parent_id=rt.last_ckpt_id,
+        )
+        saver.put(thread_id, ckpt)
+        rt.last_ckpt_id = ckpt.id
 
 
 class _NodeError:

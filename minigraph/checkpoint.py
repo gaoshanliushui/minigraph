@@ -86,11 +86,25 @@ class Checkpoint:
     #
     # 形状是 list[(channel, value)]，同一超步内多个节点写同一通道就
     # 有多条（顺序 = 节点执行顺序）。
+    #
+    # 存储上它是**独立的写入日志**，不是 checkpoint blob 的一部分
+    # （对齐 LangGraph 的 writes 表）：SqliteSaver 把它存进 writes 表，
+    # 读的时候按 idx 保序拼回这里。所以对使用者来说 Checkpoint 仍是
+    # 自包含的 —— pending_writes 是个查询视图。
     pending_writes: list[tuple[str, Any]] = field(default_factory=list)
 
     # DeltaChannel 的快照节奏计数器：通道名 -> (写入次数, 距上次快照的超步数)。
     # 满足任一阈值就落一份完整快照（见 channels.DeltaChannel 的说明）。
     delta_counters: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+    # 父 checkpoint 的 id（None = 这条线的起点）。
+    #
+    # 为什么需要显式父链（对齐 LangGraph 的 parent_checkpoint_id 列）：
+    # 历史**不是一条线**。update_state / invoke 带 checkpoint_id 从历史点
+    # 分叉后，存储里的写入顺序（seq）不再等于祖先后代关系 —— 按 seq 往回
+    # 扫会把**另一条分叉线**的写入也算进 delta 重放，状态直接算错。
+    # 有了父链，get_delta_channel_history 只走 on-path 祖先。
+    parent_id: str | None = None
 
     def copy(self) -> "Checkpoint":
         import copy as _c
@@ -107,6 +121,7 @@ class Checkpoint:
             versions_seen=_c.deepcopy(self.versions_seen),
             pending_writes=_c.deepcopy(self.pending_writes),
             delta_counters=_c.deepcopy(self.delta_counters),
+            parent_id=self.parent_id,
         )
 
 
@@ -115,6 +130,9 @@ class InMemorySaver:
 
     def __init__(self) -> None:
         self.storage: dict[str, list[Checkpoint]] = {}
+        # id -> checkpoint 索引：沿 parent_id 走祖先链时按 id 直接定位，
+        # 不用每次扫全表（分叉后"前一个"根本不是存储里的前一条）。
+        self._by_id: dict[str, Checkpoint] = {}
         self._n = 0
 
     def new_id(self) -> str:
@@ -123,6 +141,7 @@ class InMemorySaver:
 
     def put(self, thread_id: str, ckpt: Checkpoint) -> str:
         self.storage.setdefault(thread_id, []).append(ckpt)
+        self._by_id[ckpt.id] = ckpt
         return ckpt.id
 
     def list(self, thread_id: str) -> list[Checkpoint]:
@@ -143,15 +162,22 @@ class InMemorySaver:
                                   checkpoint_id: str | None = None
                                   ) -> dict[str, dict[str, Any]]:
         """
-        沿 thread 的 checkpoint 链往回走，取出每个 delta 通道的
+        沿 thread 的 **parent 链**往回走，取出每个 delta 通道的
         「种子 + 增量写入」。
 
         返回：{通道名: {"seed": 种子值(可缺省), "writes": [增量, ...]}}
 
         走法（对齐 LangGraph 的 get_delta_channel_history）：
-          从目标 checkpoint 往前找，每个通道在**最近一个存过值的祖先**
-          处停下 —— 那份值就是 seed；seed 之后积累的写入就是 writes。
-          走到底还没找到 seed -> 这个通道从空开始（seed 缺省）。
+          从目标 checkpoint 沿 parent_id 往前找，每个通道在
+          **最近一个存过值的祖先**处停下 —— 那份值就是 seed；
+          seed 之后积累的写入就是 writes。走到底还没找到 seed ->
+          这个通道从空开始（seed 缺省）。
+
+        为什么走父链而不是存储顺序（LangGraph: "walks the parent chain,
+        not list(before=...): for forked threads, only on-path ancestors
+        contribute"）：
+          从历史点分叉后，存储里两条线的 checkpoint 是交错追加的，
+          按写入顺序往回扫会把**另一条线**的写入也重放进来。
 
         为什么这样能省空间：
           有了 seed，之前的祖先就不用再看了；而 seed 每隔一段时间
@@ -159,12 +185,7 @@ class InMemorySaver:
         """
         if not channels:
             return {}
-        history = self.list(thread_id)
-        if checkpoint_id is not None:
-            for i, ckpt in enumerate(history):
-                if ckpt.id == checkpoint_id:
-                    history = history[: i + 1]
-                    break
+        target = self.get(thread_id, checkpoint_id)
 
         # 从新到旧扫。seed_by_ch 存找到的种子，writes_by_ch 累积增量。
         # 找到 seed 之后就不再往更早的祖先走（但要继续为**别的**通道走）。
@@ -183,22 +204,24 @@ class InMemorySaver:
         # 种子值 = 那个时刻的完整状态，已经包含了它自己的写入；
         # 再重放一遍就重复了（计数器这种不幂等的 reducer 会直接算错）。
         collected: list[Checkpoint] = []
-        for ckpt in reversed(history):
+        cursor = target
+        walked: set[str] = set()          # 防御：parent 链成环时止步
+        while cursor is not None and remaining and cursor.id not in walked:
+            walked.add(cursor.id)
             found_seed_here = False
             for ch in list(remaining):
-                if ch in ckpt.channel_values:
-                    seed_by_ch[ch] = ckpt.channel_values[ch]
+                if ch in cursor.channel_values:
+                    seed_by_ch[ch] = cursor.channel_values[ch]
                     remaining.discard(ch)
                     found_seed_here = True
             if found_seed_here:
                 # 这一份是种子（或含某个通道的种子）——
                 # 它自己的写入已经在种子值里了，不参与重放。
                 # 更早的祖先同理：种子值已经包含了它们。
+                cursor = self._by_id.get(cursor.parent_id)
                 continue
-            if not remaining:
-                # 所有通道都找到种子了，再往前的祖先不用看了。
-                break
-            collected.append(ckpt)
+            collected.append(cursor)
+            cursor = self._by_id.get(cursor.parent_id)
 
         # 从旧到新展开写入（collected 是新->旧，所以倒着遍历）
         for ckpt in reversed(collected):

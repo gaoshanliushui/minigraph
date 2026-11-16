@@ -419,3 +419,166 @@ def test_batch_reducer_reconstructed_across_invocations():
     for i in range(3):
         app.invoke({"items": [f"i{i}"]}, cfg)
     assert app.get_state(cfg).values["items"] == ["i0", "x", "i1", "x", "i2", "x"]
+
+
+# ------------------------------------------------------- 7. 存储结构：writes 表 + 父链
+def _fresh_savers():
+    import os, tempfile
+    return [InMemorySaver(),
+            SqliteSaver(os.path.join(tempfile.mkdtemp(), "t.db"))]
+
+
+def test_pending_writes_stored_in_writes_table():
+    """
+    SqliteSaver 把增量写入存进独立的 writes 表，不塞 checkpoint 的 JSON blob。
+
+    对齐 LangGraph 的 checkpoints + writes 两表结构：blob 只装内核状态，
+    写入日志按 (checkpoint_id, idx) 有序存放。读出来时 pending_writes
+    拼回 Checkpoint —— 它从存储字段变成了**查询视图**。
+    """
+    import json, os, tempfile
+
+    saver = SqliteSaver(os.path.join(tempfile.mkdtemp(), "t.db"))
+    app = _build(saver)
+    app.invoke({"messages": [{"id": "h1", "role": "human", "content": "q"}]},
+               {"thread_id": "t"})
+
+    raw = saver.conn.execute("SELECT data FROM checkpoints").fetchone()[0]
+    assert "pending_writes" not in json.loads(raw), "blob 里不该再有写入日志"
+
+    rows = saver.conn.execute(
+        "SELECT channel, idx FROM writes ORDER BY idx").fetchall()
+    assert [r[0] for r in rows] == ["messages", "messages"]
+    assert [r[1] for r in rows] == [0, 1], "idx 保住同一步内多条写入的顺序"
+
+    # 视图拼回：拿到的 Checkpoint 仍是自包含的
+    assert [c for c, _ in saver.get("t").pending_writes] == ["messages", "messages"]
+
+
+def test_parent_chain_links_linear_history():
+    """线性历史：每份的 parent 是前一份，首份为 None。"""
+    for saver in _fresh_savers():
+        app = _build(saver)
+        cfg = {"thread_id": "t"}
+        for i in range(1, 4):
+            app.invoke({"messages": [{"id": f"h{i}", "role": "human",
+                                      "content": "q"}]}, cfg)
+        hist = saver.list("t")
+        assert hist[0].parent_id is None, f"{type(saver).__name__}"
+        for prev, cur in zip(hist, hist[1:]):
+            assert cur.parent_id == prev.id, f"{type(saver).__name__}"
+
+
+def test_update_state_writes_delta_snapshot():
+    """
+    update_state 写了 delta 通道 -> 落一份 DeltaSnapshot。
+
+    曾经这里写的是 `if chan in rt.input_writes` —— input_writes 是
+    [(通道, 值)] 元组列表，拿字符串去 in 永远为 False，于是**从不落快照**。
+    线性历史下靠重放碰巧也是对的，只有分叉时才暴露。
+    """
+    app = _build(InMemorySaver())
+    cfg = {"thread_id": "t"}
+    app.invoke({"messages": [{"id": "h1", "role": "human", "content": "q"}]}, cfg)
+    app.update_state(cfg, {"messages": [{"id": "manual", "role": "human",
+                                          "content": "m"}]}, as_node="a")
+    raw = app.checkpointer.list("t")[-1]
+    assert isinstance(raw.channel_values.get("messages"), DeltaSnapshot)
+
+
+def test_fork_delta_replay_isolated():
+    """
+    从历史点分叉后，两条线的 delta 重放**互不串**。
+
+    存储里两条线的 checkpoint 是交错追加的。若按写入顺序（seq）往回扫，
+    分叉线会把主线的 h2/h3 也重放进来。必须沿 parent 链走 ——
+    只有 on-path 祖先参与（对齐 LangGraph 的 parent_checkpoint_id）。
+    """
+    for saver in _fresh_savers():
+        app = _build(saver)
+        cfg = {"thread_id": "t"}
+        for i in (1, 2, 3):
+            app.invoke({"messages": [{"id": f"h{i}", "role": "human",
+                                      "content": "q"}]}, cfg)
+        hist = saver.list("t")
+        snap1, snap3 = hist[0], hist[-1]
+
+        # 从 snap1 分叉：manual 只属于分叉线
+        app.update_state({**cfg, "checkpoint_id": snap1.id},
+                         {"messages": [{"id": "manual", "role": "human",
+                                        "content": "m"}]}, as_node="a")
+        assert _ids(app.get_state(cfg)) == ["h1", "a1", "manual"], \
+            f"{type(saver).__name__}: 分叉点就混进了主线的消息"
+
+        # 分叉线继续跑（产生不写快照的 checkpoint -> 必须靠重放）
+        app.invoke({"messages": [{"id": "h9", "role": "human",
+                                  "content": "q"}]}, cfg)
+        assert _ids(app.get_state(cfg)) == ["h1", "a1", "manual", "h9"], \
+            f"{type(saver).__name__}: 分叉线重放串到了主线"
+
+        # 主线从 snap3 继续：不该看见 manual / h9
+        app.invoke({"messages": [{"id": "h10", "role": "human",
+                                  "content": "q"}]},
+                   {**cfg, "checkpoint_id": snap3.id})
+        last = saver.list("t")[-1]
+        assert last.parent_id == snap3.id, "新 checkpoint 的父节点是恢复源"
+        assert _ids(app.get_state({**cfg, "checkpoint_id": last.id})) == \
+            ["h1", "a1", "h2", "h3", "h10"], \
+            f"{type(saver).__name__}: 主线重放串到了分叉线"
+
+
+def test_legacy_db_migrates_and_replays():
+    """
+    旧格式的库（无 parent 列、pending_writes 在 data blob 里）打开即用：
+
+      - 自动 ALTER 加 parent_checkpoint_id 列
+      - 旧数据是线性历史，按 seq 顺序回填 parent
+      - writes 表查不到时，回退读 data blob 里的 pending_writes
+      - 旧数据 + 新写入混合后，重放依然正确
+    """
+    import json, os, sqlite3, tempfile, time
+    from minigraph.checkpoint_sqlite import _ckpt_to_dict, _encode
+
+    # ① 造两份旧格式数据（pending_writes 放进 data blob）
+    src = SqliteSaver(os.path.join(tempfile.mkdtemp(), "src.db"))
+    app = _build(src)
+    cfg = {"thread_id": "t"}
+    for i in (1, 2):
+        app.invoke({"messages": [{"id": f"h{i}", "role": "human",
+                                  "content": "q"}]}, cfg)
+    old_rows = []
+    for ck in src.list("t"):
+        d = _ckpt_to_dict(ck)
+        d["pending_writes"] = ck.pending_writes
+        old_rows.append((ck.id, ck.step,
+                         json.dumps(_encode(d), ensure_ascii=False).encode()))
+
+    # ② 旧 schema：没有 parent_checkpoint_id 列，也没有 writes 表
+    db = os.path.join(tempfile.mkdtemp(), "old.db")
+    conn = sqlite3.connect(db)
+    conn.execute("""
+        CREATE TABLE checkpoints (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL, checkpoint_id TEXT NOT NULL,
+            step INTEGER NOT NULL, data BLOB NOT NULL,
+            created_at REAL NOT NULL)""")
+    for cid, step, blob in old_rows:
+        conn.execute(
+            "INSERT INTO checkpoints (thread_id, checkpoint_id, step,"
+            " data, created_at) VALUES ('t', ?, ?, ?, ?)",
+            (cid, step, blob, time.time()))
+    conn.commit()
+    conn.close()
+
+    # ③ 打开 = 迁移
+    saver = SqliteSaver(db)
+    hist = saver.list("t")
+    assert hist[0].parent_id is None
+    assert hist[1].parent_id == hist[0].id, "旧线性历史按 seq 回填 parent"
+    assert len(hist[-1].pending_writes) == 2, "旧格式 pending_writes 回退读取"
+
+    # ④ 旧数据能重建；继续写入（新格式）后依然正确
+    app2 = _build(saver)
+    assert _ids(app2.get_state(cfg)) == ["h1", "a1", "h2"]
+    app2.invoke({"messages": [{"id": "h3", "role": "human", "content": "q"}]}, cfg)
+    assert _ids(app2.get_state(cfg)) == ["h1", "a1", "h2", "h3"]
