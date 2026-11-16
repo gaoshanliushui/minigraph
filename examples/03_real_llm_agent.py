@@ -29,6 +29,14 @@ anthropic SDK 就够，不需要为每家写转换层。端点/模型名如有�
 测试不需要 key —— tests/test_real_llm_example.py 用 fake client
 跑通整个回环，并验证 SDK 响应落 checkpoint 的序列化路径。
 
+工具用 **@tool** 声明（minigraph/tools.py）：从函数签名 + docstring
+自动生成给模型看的 JSON Schema，不再手写 TOOL_SCHEMAS。
+模型调用和工具调用都走**中间件链**（minigraph/middleware.py）：
+
+    LogCalls（@middleware 类式，日志）
+      └─ retry_model（@wrap_model_call，失败重试）   -> 真实模型调用
+      └─ tool_guard（@wrap_tool_call，异常兜底）     -> 真实工具执行
+
 消息格式：内部直接用 **Anthropic 原生消息**（role + content blocks），
 只在消息级多挂一个 `id` 给 add_messages（按 id 追加/更新）；调 API 前
 把消息级 id 剥掉。tool_use / tool_result 靠 block 里的 id 配对，原样回传。
@@ -50,7 +58,16 @@ from dotenv import load_dotenv
 from minigraph.builder import StateGraph
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.constants import END, START
+from minigraph.middleware import (
+    MiddlewareStack,
+    ModelRequest,
+    ToolRequest,
+    middleware,
+    wrap_model_call,
+    wrap_tool_call,
+)
 from minigraph.state import DeltaChannel, State, add_messages
+from minigraph.tools import tool
 
 _ROOT = Path(__file__).resolve().parent.parent
 _ENV_PATH = _ROOT / ".env"
@@ -138,53 +155,99 @@ def _get_llm() -> _LLM:
     return _llm
 
 
+# ---------------------------------------------------------------- 中间件
+@middleware
+class LogCalls:
+    """类式中间件（@middleware）：状态钩子 + around 钩子，只打印不干预。"""
+
+    def before_agent(self, state):
+        print("  [mw] ===== agent 开始 =====")
+
+    def after_agent(self, state):
+        print(f"  [mw] ===== agent 结束：共 {len(state.get('messages', []))} 条消息 =====")
+
+    def before_model(self, state):
+        print(f"    [mw] before_model：当前历史 {len(state.get('messages', []))} 条")
+
+    def wrap_model_call(self, request, handler):
+        print(f"    [mw] model -> {request.model}（{len(request.messages)} 条消息）")
+        result = handler(request)
+        n = sum(b.get("type") == "tool_use" for b in result)
+        print(f"    [mw] model <- {len(result)} 个 block（含 {n} 个 tool_use）")
+        return result
+
+    def wrap_tool_call(self, request, handler):
+        result = handler(request)
+        print(f"    [mw] tool {request.name}({request.args}) -> {result}")
+        return result
+
+
+@wrap_model_call
+def retry_model(request, handler):
+    """函数式中间件：网络错误/5xx 最多试 3 次；4xx（key、模型名错）直接抛。"""
+    for attempt in range(3):
+        try:
+            return handler(request)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            if (status is not None and 400 <= status < 500) or attempt == 2:
+                raise
+            wait = 2 ** attempt
+            print(f"    [mw] 模型调用失败（{e}），{wait}s 后第 {attempt + 2} 次尝试")
+            time.sleep(wait)
+
+
+@wrap_tool_call
+def tool_guard(request, handler):
+    """工具异常 -> 错误文本回给模型，而不是炸掉整张图。"""
+    try:
+        return handler(request)
+    except Exception as e:
+        return f"工具执行失败: {e}"
+
+
+# 洋葱序：LogCalls 最外层 -> retry/guard -> 真实调用
+STACK = MiddlewareStack([LogCalls, retry_model, tool_guard])
+
+
 # ---------------------------------------------------------------- LLM 调用
-def chat(messages: list[dict], tools: list[dict], *, max_tokens: int = 1024) -> list[dict]:
-    """
-    一次 Messages API 调用，返回 assistant 的 content blocks（dict 列表）。
-
-    messages 是 Anthropic 原生格式：[{"role": "user"/"assistant", "content": ...}]。
-    错误（key 无效、模型名错、额度不足）由 SDK 抛 AnthropicError 子类，
-    报错信息原样带出，这里不再包一层。
-
-    为什么把 SDK 的 block 对象 model_dump() 成 dict：
-      - checkpoint 是 JSON 序列化的（SqliteSaver 不支持 pydantic 对象）；
-      - 下一轮要把 assistant 消息原样回传给 API，dict 直接可用；
-      - add_messages 按消息级 id 合并，dict 就好，不需要类实例。
-    """
-    llm = _get_llm()
-    resp = llm.client.messages.create(
-        model=llm.model,
-        max_tokens=max_tokens,
-        messages=messages,
-        tools=tools,
+def _chat_once(request: ModelRequest) -> list[dict]:
+    """真正发 HTTP 的一层（中间件链的最内层 handler）。"""
+    resp = _get_llm().client.messages.create(
+        model=request.model,
+        max_tokens=request.max_tokens,
+        messages=request.messages,
+        tools=request.tools,
     )
+    # block 对象 model_dump() 成 dict：checkpoint 走 JSON 序列化（存不了
+    # pydantic 对象），下一轮回传 API 和 add_messages 合并也都用 dict。
     return [block.model_dump() for block in resp.content]
+
+
+def chat(messages: list[dict], tools: list[dict], *, max_tokens: int = 1024) -> list[dict]:
+    """一次带中间件链的模型调用：日志 -> 重试 -> 真实请求，返回 content blocks。"""
+    req = ModelRequest(model=_get_llm().model, messages=list(messages),
+                       tools=list(tools), max_tokens=max_tokens)
+    return STACK.model_call(req, _chat_once)
 
 
 # ---------------------------------------------------------------- 本地工具
 WEATHER = {"北京": "晴 18°C", "上海": "小雨 22°C"}
 
 
+@tool
 def get_weather(city: str) -> str:
+    """查询中国城市的天气（演示数据，只有北京和上海）。
+
+    Args:
+        city: 城市名，如 北京、上海
+    """
     return WEATHER.get(city, f"{city}：数据缺失（演示工具只有北京/上海）")
 
 
-TOOLS = {"get_weather": get_weather}
-
-TOOL_SCHEMAS = [
-    {
-        "name": "get_weather",
-        "description": "查询中国城市的天气（演示数据，只有北京和上海）",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "city": {"type": "string", "description": "城市名，如 北京、上海"},
-            },
-            "required": ["city"],
-        },
-    }
-]
+# @tool 从签名 + docstring 自动生成给模型看的 JSON Schema，不再手写
+TOOLS = {get_weather.name: get_weather}
+TOOL_SCHEMAS = [get_weather.schema()]
 
 
 # ---------------------------------------------------------------- 状态
@@ -206,16 +269,19 @@ def _new_id(prefix: str) -> str:
 
 # ---------------------------------------------------------------- 节点
 def call_model(state: AgentState) -> dict:
-    """真 LLM：把历史原样发给 API（只剥掉消息级 id），存回 assistant 消息。"""
+    """真 LLM：before_model -> 调模型（around 链）-> after_model。"""
+    # 状态钩子返回的是 state 更新（本例只打印，返回 None），合并进节点返回值
+    pre = STACK.before_model(state)
     api_messages = [
         {k: v for k, v in m.items() if k != "id"} for m in state["messages"]
     ]
     content = chat(api_messages, TOOL_SCHEMAS)
-    return {"messages": [{
+    post = STACK.after_model(state)
+    return {**pre, "messages": [{
         "id": _new_id("ai"),
         "role": "assistant",
         "content": content,               # block 列表：text / tool_use ...
-    }]}
+    }], **post}
 
 
 def tool_node(state: AgentState) -> dict:
@@ -230,16 +296,19 @@ def tool_node(state: AgentState) -> dict:
     calls = [b for b in last["content"] if b.get("type") == "tool_use"]
     results = []
     for c in calls:
-        try:
-            out = TOOLS[c["name"]](**c.get("input", {}))
-        except Exception as e:                       # 工具挂了就告诉模型
-            out = f"工具执行失败: {e}"
+        # 工具执行也走中间件链：日志 + 异常兜底（tool_guard）
+        out = STACK.tool_call(ToolRequest(c), _run_tool)
         results.append({
             "type": "tool_result",
             "tool_use_id": c["id"],
-            "content": str(out),
+            "content": out,
         })
     return {"messages": [{"id": _new_id("tool"), "role": "user", "content": results}]}
+
+
+def _run_tool(request: ToolRequest) -> str:
+    """真正执行工具的一层（中间件链的最内层 handler）。"""
+    return str(TOOLS[request.name].invoke(request.args))
 
 
 def should_continue(state: AgentState) -> str:
@@ -292,13 +361,14 @@ if __name__ == "__main__":
     question = sys.argv[1] if len(sys.argv) > 1 else "北京今天天气怎么样？"
     print(f"Q: {question}   (provider={llm.provider}, model={llm.model}, db={db.name})")
 
-    for node, step, update in app.stream(
-        {"messages": [{"id": _new_id("h"), "role": "user", "content": question}]},
-        config=cfg,
-    ):
+    user_input = {"messages": [{"id": _new_id("h"), "role": "user", "content": question}]}
+    STACK.before_agent(user_input)       # agent 级钩子：整个调用一次
+
+    for node, step, update in app.stream(user_input, config=cfg):
         for m in update.get("messages", []):
             print(f"  step {step} | {node:<6} | {_brief(m)}")
 
     final = app.get_state(cfg).values["messages"]
+    STACK.after_agent({"messages": final})
     print(f"\n本 thread 共 {len(final)} 条消息；最后一条：")
     print(" ", _brief(final[-1]))

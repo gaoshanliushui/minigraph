@@ -8,6 +8,7 @@ provider 配置解析（.env / 环境变量）也在这里做纯逻辑测试。
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,6 +32,11 @@ _SPEC = importlib.util.spec_from_file_location(
     Path(__file__).resolve().parent.parent / "examples" / "03_real_llm_agent.py",
 )
 ex03 = importlib.util.module_from_spec(_SPEC)
+# 必须先注册进 sys.modules 再 exec：State.__init_subclass__ 解析字符串注解时
+# 按 cls.__module__ 查 sys.modules 拿全局命名空间；不注册的话
+# Annotated[list, DeltaChannel(...)] 求值失败，messages 静默退化成
+# last-write-wins（历史不累积）。
+sys.modules[_SPEC.name] = ex03
 _SPEC.loader.exec_module(ex03)
 
 
@@ -45,7 +51,8 @@ def test_resolve_minimax_defaults():
     assert cfg["provider"] == "minimax"
     assert cfg["api_key"] == "mm-key"
     assert cfg["base_url"] == "https://api.minimaxi.com/anthropic"
-    assert cfg["model"] == "MiniMax-M2"
+    # 默认模型跟 PROVIDERS 表走（厂商下线旧型号时只需改表，不动测试）
+    assert cfg["model"] == ex03.PROVIDERS["minimax"]["model"]
     assert cfg["auth"] == "bearer"
 
 
