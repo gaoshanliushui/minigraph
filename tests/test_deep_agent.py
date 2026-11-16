@@ -4,7 +4,10 @@ model 是 callable(ModelRequest) 协议，测试用脚本化 fake —— 不依�
 SDK、不需要 API key，但走的是完整的图回环与 state 更新。
 """
 
+import pytest
+
 from minigraph.backends import FilesystemBackend
+from minigraph.checkpoint import InMemorySaver
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.deep_agent import create_deep_agent
 from minigraph.middleware import middleware
@@ -201,6 +204,45 @@ def test_filesystem_backend_middleware_runs_real_file_tools(tmp_path):
     names = {item["name"] for item in first_request.tools}
     assert {"read_file", "write_file", "edit_file", "glob", "grep", "delete"} <= names
     assert "持久化 backend" in first_request.system
+
+
+def test_interrupt_on_pauses_real_tool_and_resumes_after_approval(tmp_path):
+    backend = FilesystemBackend(tmp_path)
+    model = FakeModel([
+        [_call("write", "write_file",
+               {"path": "/approved.txt", "content": "approved content"})],
+        [_text("done")],
+    ])
+    app = create_deep_agent(
+        model,
+        backend=backend,
+        checkpointer=InMemorySaver(),
+        interrupt_on={"write_file": True},
+    )
+    cfg = {"thread_id": "deep-hitl"}
+
+    app.invoke(dict(_INPUT), config=cfg)
+
+    pending = app.interrupted
+    assert pending["action_requests"][0]["name"] == "write_file"
+    assert pending["action_requests"][0]["args"] == {
+        "path": "/approved.txt", "content": "approved content"}
+    assert pending["review_configs"][0]["allowed_decisions"] == [
+        "approve", "edit", "reject", "respond"]
+    assert not (tmp_path / "approved.txt").exists()
+
+    out = app.invoke(None, config={
+        **cfg, "resume": {"decisions": [{"type": "approve"}]}})
+
+    assert app.interrupted is None
+    assert (tmp_path / "approved.txt").read_text() == "approved content"
+    assert "Successfully wrote" in _results(out)["write"]
+    assert out["messages"][-1]["content"][0]["text"] == "done"
+
+
+def test_interrupt_on_requires_checkpointer():
+    with pytest.raises(ValueError, match="checkpointer"):
+        create_deep_agent(FakeModel([]), interrupt_on={"write_file": True})
 
 
 def test_skills_option_loads_and_discloses_through_real_backend(tmp_path):

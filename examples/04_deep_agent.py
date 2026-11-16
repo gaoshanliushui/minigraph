@@ -7,6 +7,7 @@ backend、子代理和自动摘要**能力的深度代理（minigraph/deep_agent
     backend = FilesystemBackend(_ROOT / ".deep_agent_workspace")
     app = create_deep_agent(llm, tools=[get_weather], backend=backend,
                             system_prompt="你是旅行规划助手。",
+                            interrupt_on={"write_file": True},
                             checkpointer=SqliteSaver(...))
 
     内置工具：write_todos（待办清单 -> state["todos"]）
@@ -22,12 +23,14 @@ backend、子代理和自动摘要**能力的深度代理（minigraph/deep_agent
   - stream 输出里能看到模型先 write_todos 拆任务，再逐步执行、更新清单；
   - 中间产物通过 FilesystemMiddleware 写进 .deep_agent_workspace，最后打印文件清单；
   - 独立子任务通过 task 派给 general-purpose 子代理，并共享同一个 backend；
+  - write_file 执行前由 HumanInTheLoopMiddleware 挂起，终端批准后自动 resume；
   - 达到上下文阈值时 SummarizationMiddleware 自动压缩模型输入并转存历史。
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -81,6 +84,8 @@ if __name__ == "__main__":
         tools=[get_weather],
         backend=backend,
         system_prompt="你是旅行规划助手，回答用中文。",
+        interrupt_on={"write_file": {
+            "allowed_decisions": ["approve", "reject"]}},
         checkpointer=SqliteSaver(str(_ROOT / "minigraph.db")),
     )
     cfg = {"thread_id": "deep-demo"}
@@ -88,15 +93,30 @@ if __name__ == "__main__":
         "帮我规划北京两日游：先查天气，用 write_todos 拆任务，把每日安排写进 /plan.md，最后总结。"
     print(f"Q: {question}   (provider={info.provider}, model={info.model})\n")
 
-    for node, step, update in app.stream(
-        {"messages": [{"role": "user", "content": question}]},
-        config=cfg,
-    ):
-        for m in update.get("messages", []):
-            print(f"  step {step} | {node:<28} | {ex03._brief(m)}")
-        if "todos" in update:
-            for t in update["todos"]:
-                print(f"           todo [{t.get('status')}] {t.get('content')}")
+    run_input = {"messages": [{"role": "user", "content": question}]}
+    run_cfg = cfg
+    while True:
+        for node, step, update in app.stream(run_input, config=run_cfg):
+            for m in update.get("messages", []):
+                print(f"  step {step} | {node:<28} | {ex03._brief(m)}")
+            if "todos" in update:
+                for t in update["todos"]:
+                    print(f"           todo [{t.get('status')}] {t.get('content')}")
+
+        pending = app.interrupted
+        if pending is None:
+            break
+        print("\n工具调用等待人工审批：")
+        print(json.dumps(pending, ensure_ascii=False, indent=2, default=str))
+        decisions = []
+        for action in pending["action_requests"]:
+            answer = input(
+                f"批准执行 {action['name']} {action['args']}？[y/N] ").strip().lower()
+            decisions.append(
+                {"type": "approve"} if answer in {"y", "yes"}
+                else {"type": "reject", "message": "用户未批准这次文件写入"})
+        run_input = None
+        run_cfg = {**cfg, "resume": {"decisions": decisions}}
 
     values = app.get_state(cfg).values
     files = sorted(item["path"] for item in (backend.glob("*").matches or []))

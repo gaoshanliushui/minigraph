@@ -6,7 +6,7 @@
 能力"的**产品化组装**。本函数复刻其核心子集：
 
     create_deep_agent(model, tools, *, system_prompt, middleware,
-                      subagents, checkpointer) -> CompiledGraph
+                      subagents, checkpointer, interrupt_on) -> CompiledGraph
 
   - model        模型适配器：callable(ModelRequest) -> content blocks。
                  request.model 初始为空，由适配器填真实模型名（这样内核
@@ -31,10 +31,12 @@
             主对话只拿到它的最终结论；子代理继承同一个 backend
 
 Summarization 默认启用，可用 summarization=False 关闭；skills=["/skills"]
-会自动创建 SkillsMiddleware。显式传入的同名中间件替换默认项，其余中间件
-插在核心栈之后、Skills 之前。与真实 deepagents 仍有差异：无 memory/
-response_format；无 execute（shell 需要沙箱后端）；子代理不支持 async/远程、
-不可再嵌套 task。
+会自动创建 SkillsMiddleware。interrupt_on={"write_file": True} 会自动创建
+HumanInTheLoopMiddleware（需要 checkpointer），让主代理在指定工具执行前挂起，
+由调用方审批后 resume。显式传入的同名中间件替换默认项，其余中间件插在核心栈
+之后、Skills/HITL 之前。与真实 deepagents 仍有差异：无 memory/response_format；
+无 execute（shell 需要沙箱后端）；子代理不支持 async/远程、不可再嵌套 task，
+也暂不继承 interrupt_on（嵌套审批的恢复协议尚未实现）。
 
 工具调用默认带一个最内层的异常兜底中间件（工具异常 -> 错误文本），
 用户 middleware 在它外层；模型调用不经过这个工具兜底，需要模型重试或异常
@@ -51,6 +53,8 @@ from .builder import StateGraph
 from .constants import END
 from .middleware import (
     FilesystemMiddleware,
+    HumanInTheLoopMiddleware,
+    InterruptOnConfig,
     MiddlewareStack,
     ModelRequest,
     SkillsMiddleware,
@@ -211,7 +215,7 @@ def _merge_middleware(base: list, custom, tail: list) -> list:
 def _build_agent(model, registry: dict[str, Tool], prompt: str,
                  middleware, subapps: dict[str, Any] | None,
                  subagent_specs: list[dict], checkpointer, *, backend=None,
-                 skills=None, summarization: bool = True):
+                 skills=None, summarization: bool = True, interrupt_on=None):
     registry = dict(registry)
     if subapps is not None:
         desc = "；".join(f"{s['name']}（{s.get('description', '')}）"
@@ -250,10 +254,17 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
         if backend is None:
             raise ValueError("skills= 需要同时提供 backend")
         tail_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+    if interrupt_on:
+        tail_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
     stack = MiddlewareStack([
         *_merge_middleware(base_middleware, middleware, tail_middleware),
         _tool_guard,
     ])
+    if checkpointer is None and any(
+            isinstance(mw, HumanInTheLoopMiddleware) for mw in stack.middlewares):
+        raise ValueError(
+            "HumanInTheLoopMiddleware 需要 checkpointer；请传入 "
+            "InMemorySaver() 或 SqliteSaver(...) 以保存审批中断")
     # 中间件不仅包调用，也可以提供工具。backend 文件工具在这里覆盖同名的
     # state 虚拟工具，模型看到的 schema 与 tool_node 的 registry 始终一致。
     for mw in stack.middlewares:
@@ -320,6 +331,7 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
                       subagents: list[dict] | None = None,
                       checkpointer=None,
                       backend=None,
+                      interrupt_on: dict[str, bool | InterruptOnConfig] | None = None,
                       skills: list[str] | None = None,
                       summarization: bool = True):
     """组装一个深度代理（签名与语义对照 deepagents.create_deep_agent）。
@@ -335,6 +347,12 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
     传入 ``backend=FilesystemBackend(root_dir)`` 后，文件工具直接操作该
     backend，不再写入 state["files"]；``skills=["/skills"]`` 从同一 backend
     加载技能。Summarization 默认启用，可用 ``summarization=False`` 关闭。
+
+    ``interrupt_on={"write_file": True}`` 会在指定工具执行前挂起主代理，
+    必须同时提供 checkpointer。首次 invoke 后从 ``app.interrupted`` 取得待审
+    清单，再用 ``config={"thread_id": ..., "resume": {"decisions": [...]}}``
+    恢复。每项决定支持 approve/edit/reject/respond，具体允许哪些由工具配置
+    决定。当前该配置只作用于主代理，不会由 task 子代理继承。
     """
     registry: dict[str, Tool] = {t.name: t for t in _builtin_tools()}
     for t in tools or []:
@@ -358,4 +376,5 @@ def create_deep_agent(model: Callable[[ModelRequest], list[dict]],
     prompt = "\n\n".join(p for p in [system_prompt, BASE_PROMPT] if p)
     return _build_agent(model, registry, prompt, middleware,
                         subapps, specs, checkpointer, backend=backend,
-                        skills=skills, summarization=summarization)
+                        skills=skills, summarization=summarization,
+                        interrupt_on=interrupt_on)
