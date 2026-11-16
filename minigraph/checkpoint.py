@@ -5,15 +5,61 @@
 from __future__ import annotations
 
 import random
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# checkpoint id：UUIDv6（对齐 LangGraph checkpoint/base/id.py）
+# ---------------------------------------------------------------------------
+# 为什么用 v6 而不是 v4：v6 把 v1 的时间戳字段**重排成高位在前**，
+# 于是 id 的**字典序 == 时间序** —— 按 id 排序就是按生成先后排序，
+# 数据库索引的局部性也好（新 id 总是追加在索引末尾，不会随机插入）。
+# LangGraph 的 Checkpoint.id 注释："both unique and monotonically
+# increasing, so can be used for sorting checkpoints from first to last"。
+#
+# 实现照抄 LangGraph（它 bundled 自 oittaa/uuid6-python，纯 stdlib），
+# 去掉了 minigraph 用不到的 UUID 子类（subsec/time 等访问器）。
+_last_v6_timestamp: int | None = None
+
+
+def uuid6(node: int | None = None, clock_seq: int | None = None) -> uuid.UUID:
+    """
+    生成 UUIDv6：时间有序、全局唯一。
+
+    clock_seq / node 缺省随机；时间戳相同或时钟回拨时，用全局的
+    `_last_v6_timestamp + 1` 兜底，保证同一进程内**严格递增**。
+    """
+    global _last_v6_timestamp
+    # 0x01b21dd213814000 = UUID epoch（1582-10-15）到 Unix epoch
+    # （1970-01-01）之间的 100ns 间隔数。
+    timestamp = time.time_ns() // 100 + 0x01B21DD213814000
+    if _last_v6_timestamp is not None and timestamp <= _last_v6_timestamp:
+        timestamp = _last_v6_timestamp + 1
+    _last_v6_timestamp = timestamp
+    if clock_seq is None:
+        clock_seq = random.getrandbits(14)
+    if node is None:
+        node = random.getrandbits(48)
+    uuid_int = ((timestamp >> 12) & 0xFFFFFFFFFFFF) << 80
+    uuid_int |= (timestamp & 0x0FFF) << 64
+    uuid_int |= (clock_seq & 0x3FFF) << 48
+    uuid_int |= node & 0xFFFFFFFFFFFF
+    # variant = RFC 4122（10xx），version = 6
+    uuid_int &= ~(0xC000 << 48)
+    uuid_int |= 0x8000 << 48
+    uuid_int &= ~(0xF000 << 64)
+    uuid_int |= 6 << 76
+    return uuid.UUID(int=uuid_int)
 
 
 @dataclass
 class Checkpoint:
-    # checkpoint 的唯一标识，由 InMemorySaver.new_id() 生成
-    # （形如 "ckpt-0001-abcd"），主要给 get_state(checkpoint_id=...) / 时间
-    # 旅行 / update_state 用来精确定位某一份历史快照。
+    # checkpoint 的唯一标识，由 saver.new_id() 生成的 **UUIDv6**：
+    # 字典序 == 生成先后（单调递增），所以按 id 排序就是按时间排序。
+    # 主要给 get_state(checkpoint_id=...) / 时间旅行 / update_state
+    # 用来精确定位某一份历史快照；parent_id 也以它链接祖先链。
     id: str
 
     # 这一份快照对应的超步编号。第 1 步 = 入口节点刚跑完，
@@ -138,11 +184,10 @@ class InMemorySaver:
         # id -> checkpoint 索引：沿 parent_id 走祖先链时按 id 直接定位，
         # 不用每次扫全表（分叉后"前一个"根本不是存储里的前一条）。
         self._by_id: dict[str, Checkpoint] = {}
-        self._n = 0
 
     def new_id(self) -> str:
-        self._n += 1
-        return f"ckpt-{self._n:04d}-{random.randint(0, 0xFFFF):04x}"
+        """UUIDv6：字典序 == 生成先后，可直接当排序键。"""
+        return str(uuid6())
 
     def put(self, thread_id: str, ckpt: Checkpoint) -> str:
         self.storage.setdefault(thread_id, []).append(ckpt)

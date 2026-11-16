@@ -59,10 +59,9 @@ import os
 import sqlite3
 import threading
 import time
-import uuid
 from typing import Any
 
-from .checkpoint import Checkpoint
+from .checkpoint import Checkpoint, uuid6
 from .channels import DeltaSnapshot
 from .constants import MISSING, WRITES_IDX_MAP
 from .control import Send
@@ -224,7 +223,6 @@ class SqliteSaver:
         # RLock：get_delta_channel_history 在持锁遍历父链时逐步调 get()
         # （get 自己也持锁），普通 Lock 会自死锁。
         self.lock = threading.RLock()
-        self._n = 0
         self._setup()
 
     @classmethod
@@ -271,10 +269,13 @@ class SqliteSaver:
 
     # -- InMemorySaver 同名接口 --------------------------------------------
     def new_id(self) -> str:
-        """生成 checkpoint id。带随机后缀 —— 多个进程写同一个库也不会撞。"""
-        with self.lock:
-            self._n += 1
-            return f"ckpt-{self._n:04d}-{uuid.uuid4().hex[:8]}"
+        """
+        UUIDv6：字典序 == 生成先后（多进程写同一个库也不会撞）。
+
+        对齐 LangGraph：checkpoint id 单调递增，可直接当排序键；
+        时间序高位在前也让 B-tree 索引总是末尾追加，局部性好。
+        """
+        return str(uuid6())
 
     def put(self, thread_id: str, ckpt: Checkpoint) -> str:
         blob = json.dumps(_encode(_ckpt_to_dict(ckpt)),

@@ -655,6 +655,26 @@ def test_resume_logged_as_special_channel():
             assert idx == -4
 
 
+def test_checkpoint_ids_are_uuid6_and_monotonic():
+    """
+    checkpoint id 是 **UUIDv6**（对齐 LangGraph 的 checkpoint/base/id.py）。
+
+    两个性质：
+      - version == 6，能被标准 uuid 解析
+      - **字典序 == 生成先后**（v6 把时间戳重排成高位在前）——
+        所以按 id 排序就是按时间排序，B-tree 索引也总是末尾追加。
+    """
+    import uuid as _uuid
+
+    for saver in _fresh_savers():
+        ids = [saver.new_id() for _ in range(200)]
+        parsed = [_uuid.UUID(i) for i in ids]
+        assert all(u.version == 6 for u in parsed), f"{type(saver).__name__}"
+        assert len(set(ids)) == len(ids), "id 不能撞"
+        assert ids == sorted(ids), \
+            f"{type(saver).__name__}: 同进程内 id 应严格递增（时间有序）"
+
+
 def test_no_writes_marker_for_silent_superstep():
     """
     一个超步跑了但什么都没写 -> writes 里留 __no_writes__ 占位。
