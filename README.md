@@ -346,6 +346,20 @@ class S(State):
 控制写入不参与重放，但让这份日志成为完整的执行记录 —— 谁写了什么、
 谁唤醒了谁，都在表里。
 
+特殊通道是**事件**而不是状态（对齐 LangGraph 的 reserved write keys）：
+
+| 通道 | 何时记 | 值 |
+| --- | --- | --- |
+| `__interrupt__` | 超步因 interrupt 挂起 | 本步所有挂起点的 payload 列表 |
+| `__resume__` | resume 恢复后的第一份 checkpoint | 用户给的 resume 值 |
+| `__no_writes__` | 超步跑了但什么都没写 | `None` |
+
+`__interrupt__` / `__resume__` 在 writes 表里用**负 idx**（-3 / -4，对齐
+`WRITES_IDX_MAP`），与普通写入（0 起）错开。这些事件通道不参与 delta
+重放；挂起/恢复的机制仍由 Checkpoint 的 `interrupts` / `resumes` / `slots`
+字段承载。注意 LangGraph 的 `NO_WRITES` 是**按任务**记的，还用于
+"已完成任务不重跑"；minigraph 整步回滚用不上那个用途，只把它当日志。
+
 `Checkpoint.pending_writes` 是个**查询视图**：写入时拆进 `writes` 表，
 读出时拼回 —— Checkpoint 对使用者仍是自包含的。
 

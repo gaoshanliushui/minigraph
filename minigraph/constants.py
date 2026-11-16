@@ -36,6 +36,25 @@ JOIN = "join:{}"
 TASKS = "__pregel_tasks"
 
 # ---------------------------------------------------------------------------
+# 特殊写入通道：不是状态，是**事件**（对齐 LangGraph 的 reserved write keys）
+# ---------------------------------------------------------------------------
+# 它们也进 writes 表，让这份日志能直接回答"这份 checkpoint 为什么挂起、
+# 是哪次 resume 唤醒的、哪一步跑了但什么都没写"。delta 重放按通道名
+# 挑取，这些事件通道天然被过滤，不参与状态重建。
+INTERRUPT = "__interrupt__"    # 挂起事件；值 = 本步所有挂起点的 payload 列表
+RESUME = "__resume__"          # 恢复事件；值 = 用户给的 resume 值
+NO_WRITES = "__no_writes__"    # 这个超步跑了但什么都没写（占位标记）
+
+# 特殊写入用**负 idx**，普通写入从 0 开始，互不冲突
+# （对齐 LangGraph checkpoint/base 的 WRITES_IDX_MAP =
+#  {ERROR: -1, SCHEDULED: -2, INTERRUPT: -3, RESUME: -4}；
+#  minigraph 没有 ERROR/SCHEDULED 这两个概念，只留用得上的两个）。
+# 每份 checkpoint 每类特殊通道至多一条 —— minigraph 的 writes 表主键是
+# (thread_id, checkpoint_id, idx)，没有 LangGraph 的 task_id 维度，
+# 所以多个挂起点合成一条 __interrupt__（值是列表），而不是各占一行。
+WRITES_IDX_MAP = {INTERRUPT: -3, RESUME: -4}
+
+# ---------------------------------------------------------------------------
 # DeltaChannel 的快照节奏
 # ---------------------------------------------------------------------------
 # 距上次快照最多隔多少个超步，就必须再落一份完整快照。

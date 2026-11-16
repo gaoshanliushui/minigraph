@@ -592,3 +592,94 @@ def test_legacy_db_migrates_and_replays():
     assert _ids(app2.get_state(cfg)) == ["h1", "a1", "h2"]
     app2.invoke({"messages": [{"id": "h3", "role": "human", "content": "q"}]}, cfg)
     assert _ids(app2.get_state(cfg)) == ["h1", "a1", "h2", "h3"]
+
+
+# ------------------------------------------------------- 8. 特殊通道：事件也进 writes 表
+def _build_interrupt_app(saver):
+    class S(State):
+        messages: Annotated[list, DeltaChannel(add_messages, list)]
+
+    def a(state):
+        ans = interrupt({"ask": "ok?"})
+        return {"messages": [{"id": "a1", "role": "assistant",
+                              "content": f"got {ans}"}]}
+
+    g = StateGraph(S)
+    g.add_node("a", a)
+    g.add_edge(START, "a")
+    g.add_edge("a", END)
+    return g.compile(checkpointer=saver)
+
+
+def test_interrupt_logged_as_special_channel():
+    """
+    挂起 -> writes 里留一条 __interrupt__（值 = 本步挂起点的 payload 列表）。
+
+    对齐 LangGraph 的 reserved write keys：特殊写入用**负 idx**
+    （WRITES_IDX_MAP = {INTERRUPT: -3, RESUME: -4}），与普通写入错开。
+    它只是日志 —— 恢复机制仍靠 Checkpoint 的 interrupts/resumes/slots。
+    """
+    for saver in _fresh_savers():
+        app = _build_interrupt_app(saver)
+        cfg = {"thread_id": "t"}
+        app.invoke({"messages": [{"id": "h1", "role": "human",
+                                  "content": "q"}]}, cfg)
+        raw = saver.list("t")[-1]
+        events = {c: v for c, v in raw.pending_writes if c == "__interrupt__"}
+        assert events == {"__interrupt__": [{"ask": "ok?"}]}, \
+            f"{type(saver).__name__}: {raw.pending_writes}"
+        if isinstance(saver, SqliteSaver):
+            idx = saver.conn.execute(
+                "SELECT idx FROM writes WHERE channel = '__interrupt__'"
+            ).fetchone()[0]
+            assert idx == -3, "特殊写入用负 idx，与普通写入（0 起）错开"
+
+
+def test_resume_logged_as_special_channel():
+    """resume 恢复后，第一份新 checkpoint 的 writes 里有 __resume__（idx=-4）。"""
+    for saver in _fresh_savers():
+        app = _build_interrupt_app(saver)
+        cfg = {"thread_id": "t"}
+        app.invoke({"messages": [{"id": "h1", "role": "human",
+                                  "content": "q"}]}, cfg)
+        app.invoke(None, {**cfg, "resume": "yes"})
+        raw = saver.list("t")[-1]
+        assert ("__resume__", "yes") in raw.pending_writes, \
+            f"{type(saver).__name__}: {raw.pending_writes}"
+        # 事件通道不参与重放，状态重建不受影响
+        assert _ids(app.get_state(cfg)) == ["h1", "a1"]
+        if isinstance(saver, SqliteSaver):
+            idx = saver.conn.execute(
+                "SELECT idx FROM writes WHERE channel = '__resume__'"
+            ).fetchone()[0]
+            assert idx == -4
+
+
+def test_no_writes_marker_for_silent_superstep():
+    """
+    一个超步跑了但什么都没写 -> writes 里留 __no_writes__ 占位。
+
+    第一份 checkpoint 总有写入（输入 / __start__ 点亮入口），所以
+    "沉默超步"用第二个节点来造。
+    """
+    class S(State):
+        n: Annotated[int, operator.add]
+
+    def a(state):
+        return {"n": 1}
+
+    def b(state):
+        return {}               # 沉默：什么都不写
+
+    g = StateGraph(S)
+    g.add_node("a", a)
+    g.add_node("b", b)
+    g.add_edge(START, "a")
+    g.add_edge("a", "b")
+    g.add_edge("b", END)
+    for saver in _fresh_savers():
+        app = g.compile(checkpointer=saver)
+        app.invoke(None, {"thread_id": "t"})
+        raw = saver.list("t")[-1]       # b 所在的那个超步
+        assert raw.pending_writes == [("__no_writes__", None)], \
+            f"{type(saver).__name__}: {raw.pending_writes}"

@@ -65,7 +65,10 @@ from .constants import (
     BRANCH_TO,
     DELTA_MAX_SUPERSTEPS_SINCE_SNAPSHOT,
     END,
+    INTERRUPT,
     MISSING,
+    NO_WRITES,
+    RESUME,
     Reducer,
     START,
     TASKS,
@@ -733,6 +736,10 @@ class CompiledGraph:
                     )
                 if has_resume:
                     store = _merge_resume(store, pending, resume_val)
+                    # 记一条 __resume__ 事件：它会并进恢复后第一份
+                    # checkpoint 的 writes（对齐 LangGraph 把 resume 值
+                    # 也写进 writes 表）。只是日志，重放时被过滤。
+                    rt.input_writes.insert(0, (RESUME, resume_val))
                 _ctx()["resume"] = store
                 if debug:
                     print(f"[resume] step={rt.step} from interrupt at "
@@ -894,6 +901,13 @@ class CompiledGraph:
                 if rt.input_writes:
                     step_writes = list(rt.input_writes) + step_writes
                     rt.input_writes = []
+                if not step_writes:
+                    # 这个超步跑了但什么都没写（节点返回 {} 之类）——
+                    # 留一条 __no_writes__ 占位，让"跑过但没写"在日志里
+                    # 可见（对齐 LangGraph 的 NO_WRITES）。
+                    # LangGraph 按任务记、用于"已完成任务不重跑"；
+                    # minigraph 整步回滚用不上那个用途，这里只是日志。
+                    step_writes = [(NO_WRITES, None)]
                 self._save(rt, saver, thread_id, step_writes)
 
         _ctx()["slot"] = None
@@ -1017,13 +1031,19 @@ class CompiledGraph:
             channel_values={c: ch.checkpoint() for c, ch in rt.channels.items()},
             channel_versions=dict(rt.versions),
             versions_seen={k: dict(v) for k, v in rt.seen.items()},
-            # 这一步的写入被整步回滚了，所以 pending_writes 是空的 ——
-            # 恢复时祖先链会找到上一步的那份，状态不会丢。
+            # 这一步的写入被整步回滚了，所以 pending_writes 里没有节点
+            # 写入 —— 恢复时祖先链会找到上一步的那份，状态不会丢。
             #
             # **例外**：本次运行的**输入**还没进过任何 checkpoint（第一步就
             # 挂了），它必须在这里落一次，否则 delta 通道重建时输入这段
             # 就凭空丢了。
-            pending_writes=list(rt.input_writes),
+            #
+            # 另外记一条 __interrupt__ 事件（值 = 本步所有挂起点的
+            # payload）：writes 表因此能直接回答"这份 checkpoint 为什么
+            # 挂起"。它只是日志，恢复机制仍靠上面的 interrupts/resumes/
+            # slots 字段（minigraph 整步回滚，与 LangGraph 不同）。
+            pending_writes=([(INTERRUPT, [h.value for h in hits])]
+                            + list(rt.input_writes)),
             delta_counters=dict(rt.delta_counters),
             parent_id=rt.last_ckpt_id,
         )

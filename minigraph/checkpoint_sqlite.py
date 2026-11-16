@@ -64,7 +64,7 @@ from typing import Any
 
 from .checkpoint import Checkpoint
 from .channels import DeltaSnapshot
-from .constants import MISSING
+from .constants import MISSING, WRITES_IDX_MAP
 from .control import Send
 
 # 类型标签的键名。刻意起个不容易撞的名字 —— 用户的 state 里可能真的有个
@@ -281,8 +281,10 @@ class SqliteSaver:
                           ensure_ascii=False).encode("utf-8")
         # 增量写入走 writes 表，不进 data blob。idx 保序 —— 同一超步内
         # 多条写入的先后顺序对顺序敏感的 reducer 有意义。
+        # 特殊通道（__interrupt__/__resume__）按 WRITES_IDX_MAP 用负 idx，
+        # 与普通写入（0 起）错开，互不冲突（对齐 LangGraph）。
         write_rows = [
-            (thread_id, ckpt.id, idx, chan,
+            (thread_id, ckpt.id, WRITES_IDX_MAP.get(chan, idx), chan,
              json.dumps(_encode(val), ensure_ascii=False).encode("utf-8"))
             for idx, (chan, val) in enumerate(ckpt.pending_writes)
         ]
