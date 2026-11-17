@@ -2,7 +2,7 @@
 def print_graph(app):
     print("=== compiled channels (control-flow channels) ===")
     for k, v in app.channels.items():
-        print(f"  {k!r:24} -> {type(v).__name__}")
+        print(f"  {k!r:60} -> {type(v).__name__}")
     print()
 
     print("=== node : triggers / writers ===")

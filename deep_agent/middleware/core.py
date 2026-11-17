@@ -581,6 +581,7 @@ def _chain(g, src: str, names: list[str]) -> str:
 def wire_middleware_graph(g, stack: "MiddlewareStack", *,
                           model_node: str = "model",
                           tools_node: str = "tools",
+                          join_node: str | None = None,
                           route: Callable[[dict], str] | None = None,
                           state_schema=None):
     """
@@ -588,7 +589,12 @@ def wire_middleware_graph(g, stack: "MiddlewareStack", *,
 
     参数：
       model_node / tools_node  两个主节点的名字
-      route                    路由函数：state -> "tools" | END。
+      join_node                可选的"结果汇总"节点。给了它，工具回环就变成
+                               tools -> join_node -> before_model* -> model：
+                               并行工具任务各写各的结果，汇总节点再拼成
+                               一条消息。不给就是 tools -> before_model* -> model。
+      route                    路由函数：state -> "tools" | END，
+                               也可以返回 list[Send] 做并行扇出。
                                决定模型之后是去工具还是收尾。
       state_schema             agent 的 state schema（要含 jump_to 字段）
 
@@ -596,7 +602,7 @@ def wire_middleware_graph(g, stack: "MiddlewareStack", *,
 
     接线规则（对齐 LangChain factory.py）：
       - 入口：START -> before_agent* -> before_model* -> model
-      - 回环：tools -> before_model* -> model
+      - 回环：tools -> join_node? -> before_model* -> model
       - 出口：model -> after_model* -> 路由
       - 收尾：路由的 END 分支 -> after_agent* -> END
       - 声明了 can_jump_to 的钩子节点：出边是条件边，跳转优先于默认走向
@@ -681,17 +687,24 @@ def wire_middleware_graph(g, stack: "MiddlewareStack", *,
     else:
         g.add_edge(START, hooks["before_agent"][0])
 
-    # ---- 回环：tools -> before_model* -> model ----
+    # ---- 回环：tools -> join_node? -> before_model* -> model ----
     # 入口链和回环链的尾节点常常是同一个（before_model 链尾）。
     # 它的出边只能接一次 —— 接两次会变成两条条件边，
     # 节点每轮被触发两次，图就转起来了。_wire 的 wired 集合负责去重。
     _wire_chain(hooks["before_model"], model_node)
     # 没有工具节点的图（纯问答 agent）就不接这条回环
     if tools_node in g.nodes:
+        # 工具节点可能收到多个并行任务（Send 扇出），但**汇总**只该发生一次，
+        # 所以回环的静态边挂在 join_node 上：所有并行任务跑完后，
+        # join_node 被触发一次，把结果拼成一条消息再回模型。
+        after_tools = join_node if (join_node and join_node in g.nodes) \
+            else tools_node
         if hooks["before_model"]:
-            g.add_edge(tools_node, hooks["before_model"][0])
+            g.add_edge(after_tools, hooks["before_model"][0])
         else:
-            g.add_edge(tools_node, model_node)
+            g.add_edge(after_tools, model_node)
+        if after_tools != tools_node:
+            g.add_edge(tools_node, after_tools)
 
     # ---- 出口：model -> after_model* -> 路由 ----
     # 链尾的出边在"路由边"那一段统一处理（它是路由源，不是静态边）。

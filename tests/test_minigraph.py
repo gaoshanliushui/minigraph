@@ -469,6 +469,81 @@ def test_interrupt_inside_parallel_batch_rolls_back_the_superstep():
     assert out["log"] == ["fast", "slow:ok"]           # 不丢、不重复
 
 
+def test_successful_sibling_is_not_reexecuted_after_rollback():
+    """
+    并行批里有人挂起 -> 整步回滚，但**已经跑成功的兄弟不该重跑**。
+
+    重跑 = 副作用重复发生（写文件、发请求）。挂起那个任务的重跑是
+    不可避免的（节点要从头再来），但成功的兄弟不该跟着再来一遍。
+
+    对齐 LangGraph 的 `_reapply_writes_to_succeeded_nodes`。
+    """
+    executed = []
+
+    class S(State):
+        log: Annotated[list, operator.add]
+
+    def side_effect(s):
+        executed.append("effect")
+        return {"log": ["effect"]}
+
+    def waits(s):
+        v = interrupt("wait")
+        return {"log": [f"wait:{v}"]}
+
+    g = StateGraph(S)
+    g.add_node("fork", lambda s: [Send("effect", {}), Send("wait", {})])
+    g.add_node("effect", side_effect)
+    g.add_node("wait", waits)
+    g.add_edge(START, "fork")
+    g.add_edge("fork", "effect")
+    g.add_edge("fork", "wait")
+    g.add_edge("effect", "wait")     # 让两者落在同一超步
+    g.add_edge("wait", END)
+
+    app = g.compile(InMemorySaver())
+    cfg = {"thread_id": "no-reexec"}
+
+    app.invoke({"log": []}, cfg)
+    # 第一轮：两边都跑，wait 挂起 -> 整步回滚
+    assert executed == ["effect"]           # 副作用已经发生（回滚不回滚副作用）
+
+    out = app.invoke(None, {**cfg, "resume": "ok"})
+    # 恢复时 effect **不重跑**（它的写入被复用），只补跑 wait
+    assert executed == ["effect"]           # 没有第二次副作用
+    assert out["log"] == ["effect", "wait:ok"]
+
+
+def test_reused_sibling_writes_keep_their_original_order():
+    """复用来的写入按**原来的任务顺序**落进通道（reducer 合并顺序不能乱）。"""
+    class S(State):
+        log: Annotated[list, operator.add]
+
+    def first(s):
+        return {"log": ["first"]}
+
+    def second(s):
+        v = interrupt("wait")
+        return {"log": [f"second:{v}"]}
+
+    g = StateGraph(S)
+    g.add_node("fork", lambda s: [Send("first", {}), Send("second", {})])
+    g.add_node("first", first)
+    g.add_node("second", second)
+    g.add_edge(START, "fork")
+    g.add_edge("fork", "first")
+    g.add_edge("fork", "second")
+    g.add_edge("first", "second")
+    g.add_edge("second", END)
+
+    app = g.compile(InMemorySaver())
+    cfg = {"thread_id": "order"}
+
+    app.invoke({"log": []}, cfg)
+    out = app.invoke(None, {**cfg, "resume": "ok"})
+    assert out["log"] == ["first", "second:ok"]
+
+
 # ---------------------------------------------------------------- 6b. 多个中断
 def _two_interrupting_graph():
     """两个节点在同一超步里各自 interrupt。"""

@@ -32,6 +32,11 @@ def interrupt(value: Any) -> Any:
 
     注意节点会从头重跑，所以 interrupt 之前的副作用必须幂等。
 
+    但**兄弟任务**不用为这件事操心：同一超步里别人挂起时，
+    已经跑成功的那些任务不会重跑 —— 它们的写入被存进 checkpoint，
+    恢复时直接用掉（对齐 LangGraph 的 `_reapply_writes_to_succeeded_nodes`）。
+    也就是说，只有**调用 interrupt() 的那个节点**需要幂等。
+
     resume 值按**槽位**存放，一个槽位是一个队列：
       - 多个节点并行挂起：每个节点一个槽位，各拿各的值
       - 一个节点里多次 interrupt()：同一个槽位多个值，按调用顺序出队
