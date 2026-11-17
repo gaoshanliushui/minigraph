@@ -951,6 +951,10 @@ class CompiledGraph:
 
             # ③ 并发跑本批任务
             all_runs = self._assign_slots(tasks, rt.step, snap)
+            # checkpoint 里的 slot 映射只用于恢复当初挂起的那一批任务。
+            # 本批提交后，后续超步是新的图任务，必须分配新 slot；否则循环
+            # 节点会一路沿用旧 slot，在下一次 interrupt() 错读旧 resume[0]。
+            snap = None
 
             # 上一次挂起时已经**跑成功**的兄弟任务：它们的写入被存进了
             # checkpoint，这里直接用掉、不重跑（对齐 LangGraph 的
