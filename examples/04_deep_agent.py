@@ -134,9 +134,9 @@ if __name__ == "__main__":
         checkpointer=SqliteSaver(str(_ROOT / "minigraph.db")),
     )
 
-    print_graph(app)
+    # print_graph(app)
 
-    cfg = {"thread_id": "deep-demo"}
+    cfg = {"thread_id": "deep-demo3"}
     one_shot = sys.argv[1] if len(sys.argv) > 1 else None
     print(f"provider={info.provider}, model={info.model}, thread={cfg['thread_id']}")
     if one_shot is None:
