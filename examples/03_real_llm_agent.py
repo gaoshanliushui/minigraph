@@ -19,9 +19,9 @@
     uv sync --extra llm
     uv run --extra llm python examples/03_real_llm_agent.py "北京今天天气怎么样？"
 
-内置 provider：anthropic（官方）、minimax、volcengine（火山引擎·方舟）。
-三家都讲 **Anthropic Messages 协议**（MiniMax / 方舟提供 Anthropic 兼容
-端点，Claude Code 就是走它接入的），所以一份消息格式、一个官方
+内置 provider：anthropic（官方）、minimax、volcengine（火山引擎·方舟）、deepseek。
+四家都讲 **Anthropic Messages 协议**（MiniMax / 方舟 / DeepSeek 提供 Anthropic
+兼容端点，Claude Code 就是走它接入的），所以一份消息格式、一个官方
 anthropic SDK 就够，不需要为每家写转换层。端点/模型名如有调整，
 改 .env 里的 LLM_BASE_URL / LLM_MODEL 即可，不用动代码。
 
@@ -84,7 +84,7 @@ _ENV_PATH = _ROOT / ".env"
 
 # ---------------------------------------------------------------- provider 配置
 # 每家只需四项：Anthropic 兼容端点、key 的环境变量名、默认模型、认证头方式。
-#   auth = "bearer"    -> Authorization: Bearer <key>（MiniMax / 方舟的 Claude Code 接法）
+#   auth = "bearer"    -> Authorization: Bearer <key>（MiniMax / 方舟 / DeepSeek）
 #   auth = "x-api-key" -> x-api-key: <key>（Anthropic 官方）
 PROVIDERS = {
     "anthropic": {
@@ -200,12 +200,19 @@ class LogCalls:
         return result
 
 
+class _IncompleteModelResponse(RuntimeError):
+    """HTTP 请求成功，但响应被截断或没有 agent 可处理的内容。"""
+
+
 @wrap_model_call
 def retry_model(request, handler):
     """函数式中间件：网络错误/5xx 最多试 3 次；4xx（key、模型名错）直接抛。"""
     for attempt in range(3):
         try:
             return handler(request)
+        except _IncompleteModelResponse:
+            # 同样的请求预算重试只会再次截断；先让调用方看到 stop_reason。
+            raise
         except Exception as e:
             status = getattr(e, "status_code", None)
             if (status is not None and 400 <= status < 500) or attempt == 2:
@@ -240,6 +247,10 @@ def _chat_once(request: ModelRequest) -> list[dict]:
 
     没开 custom 模式时 get_stream_writer() 是 no-op，token 照常累积，
     行为等价于一次性调用（只是多花了流式的解析开销）。
+
+    content 之外还必须检查 stop_reason：thinking 同样计入 max_tokens，
+    预算耗尽时可能只有 thinking，甚至留下参数不完整的 tool_use。这样的
+    HTTP 200 响应不能当作最终答案，也不能继续执行工具。
     """
     kwargs = {"system": request.system} if request.system else {}
     writer = get_stream_writer()
@@ -254,12 +265,35 @@ def _chat_once(request: ModelRequest) -> list[dict]:
             # 每个 token 立即送出去；消费者拿到的是纯文本片段。
             writer({"type": "token", "text": text})
         resp = stream.get_final_message()
+
     # block 对象 model_dump() 成 dict：checkpoint 走 JSON 序列化（存不了
     # pydantic 对象），下一轮回传 API 和 add_messages 合并也都用 dict。
-    return [block.model_dump() for block in resp.content]
+    blocks = [block.model_dump() for block in resp.content]
+    stop_reason = getattr(resp, "stop_reason", None)
+    block_types = [b.get("type") for b in blocks]
+    if stop_reason == "max_tokens":
+        raise _IncompleteModelResponse(
+            f"模型输出被 max_tokens={request.max_tokens} 截断"
+            f"（stop_reason={stop_reason!r}, block_types={block_types}）。"
+            "thinking 也占用输出预算；请增大 max_tokens 后重试，"
+            "不要把截断的 thinking 或 tool_use 当作有效结果。"
+        )
+
+    has_result = any(
+        b.get("type") == "tool_use"
+        or (b.get("type") == "text" and bool(b.get("text")))
+        for b in blocks
+    )
+    if not has_result:
+        raise _IncompleteModelResponse(
+            "模型没有返回正文或工具调用"
+            f"（stop_reason={stop_reason!r}, block_types={block_types}）。"
+            "thinking 是推理内容，不是最终答案；请检查模型/兼容端点的响应。"
+        )
+    return blocks
 
 
-def chat(messages: list[dict], tools: list[dict], *, max_tokens: int = 1024,
+def chat(messages: list[dict], tools: list[dict], *, max_tokens: int = 8192,
          state: dict | None = None) -> list[dict]:
     """一次带中间件链的模型调用：日志 -> 重试 -> 真实请求，返回 content blocks。"""
     req = ModelRequest(model=_get_llm().model, messages=list(messages),

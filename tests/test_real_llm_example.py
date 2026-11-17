@@ -56,6 +56,17 @@ def test_resolve_minimax_defaults():
     assert cfg["auth"] == "bearer"
 
 
+def test_resolve_deepseek_defaults():
+    env = {"LLM_PROVIDER": "deepseek", "DEEPSEEK_API_KEY": "ds-key"}
+    with patch.dict(os.environ, env, clear=True):
+        cfg = ex03._resolve(os.environ)
+    assert cfg["provider"] == "deepseek"
+    assert cfg["api_key"] == "ds-key"
+    assert cfg["base_url"] == "https://api.deepseek.com/anthropic"
+    assert cfg["model"] == ex03.PROVIDERS["deepseek"]["model"]
+    assert cfg["auth"] == "bearer"
+
+
 def test_resolve_volcengine_with_overrides():
     env = {
         "LLM_PROVIDER": "volcengine",
@@ -111,8 +122,9 @@ class _FakeStream:
     get_final_message 返回带 .content 的对象，content 是带 model_dump 的 block。
     """
 
-    def __init__(self, blocks):
+    def __init__(self, blocks, stop_reason="end_turn"):
         self._blocks = blocks
+        self._stop_reason = stop_reason
         self.text_stream = iter(
             b["text"] for b in blocks if b.get("type") == "text"
         )
@@ -125,7 +137,9 @@ class _FakeStream:
 
     def get_final_message(self):
         return SimpleNamespace(
-            content=[_Block(**b) for b in self._blocks])
+            content=[_Block(**b) for b in self._blocks],
+            stop_reason=self._stop_reason,
+        )
 
 
 class _FakeMessages:
@@ -133,16 +147,25 @@ class _FakeMessages:
         self._responses = list(responses)
         self.calls = []                     # 每次调用的 kwargs，供断言请求体
 
+    def _pop_response(self):
+        assert self._responses, "fake client 的响应用完了（回环次数超预期）"
+        response = self._responses.pop(0)
+        # 普通响应直接给 block list；(blocks, stop_reason) 可模拟截断等结束原因。
+        if isinstance(response, tuple):
+            return response
+        return response, "end_turn"
+
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        assert self._responses, "fake client 的响应用完了（回环次数超预期）"
-        return SimpleNamespace(content=[_Block(**b) for b in self._responses.pop(0)])
+        blocks, stop_reason = self._pop_response()
+        return SimpleNamespace(
+            content=[_Block(**b) for b in blocks], stop_reason=stop_reason)
 
     def stream(self, **kwargs):
         # 示例的 _chat_once 现在走流式接口；复用同一份响应脚本。
         self.calls.append(kwargs)
-        assert self._responses, "fake client 的响应用完了（回环次数超预期）"
-        return _FakeStream(self._responses.pop(0))
+        blocks, stop_reason = self._pop_response()
+        return _FakeStream(blocks, stop_reason)
 
 
 class _FakeClient:
@@ -165,6 +188,51 @@ _TWO_ROUNDS = [
 ]
 
 _INPUT = {"messages": [{"id": "h1", "role": "user", "content": "北京天气怎么样"}]}
+
+
+def test_thinking_is_preserved_but_not_streamed_as_answer():
+    """带签名的 thinking 留给协议历史；custom 流只发送最终 text。"""
+    thinking = {"type": "thinking", "thinking": "先分析", "signature": "sig"}
+    answer = {"type": "text", "text": "最终答案"}
+    llm = _fake_llm([[thinking, answer]])
+    events = []
+    request = ex03.ModelRequest(
+        model="test-model", messages=[{"role": "user", "content": "问题"}])
+
+    with (patch.object(ex03, "_get_llm", return_value=llm),
+          patch.object(ex03, "get_stream_writer", return_value=events.append)):
+        content = ex03._chat_once(request)
+
+    assert content == [thinking, answer]
+    assert events == [{"type": "token", "text": "最终答案"}]
+    assert llm.client.messages.calls[0]["max_tokens"] == 8192
+
+
+def test_thinking_only_max_tokens_error_is_not_retried():
+    """只有 thinking 且达到 token 上限时，给出预算诊断且不重复请求。"""
+    thinking = {"type": "thinking", "thinking": "还没想完", "signature": "sig"}
+    llm = _fake_llm([([thinking], "max_tokens")])
+
+    with patch.object(ex03, "_get_llm", return_value=llm):
+        with pytest.raises(ex03._IncompleteModelResponse,
+                           match="max_tokens=1024"):
+            ex03.chat([{"role": "user", "content": "问题"}], [],
+                      max_tokens=1024)
+
+    assert len(llm.client.messages.calls) == 1
+
+
+def test_thinking_only_normal_stop_is_still_an_incomplete_response():
+    """即使 stop_reason=end_turn，只有 thinking 也不能伪装成最终答案。"""
+    thinking = {"type": "thinking", "thinking": "只有推理", "signature": "sig"}
+    llm = _fake_llm([[thinking]])
+    request = ex03.ModelRequest(
+        model="test-model", messages=[{"role": "user", "content": "问题"}])
+
+    with patch.object(ex03, "_get_llm", return_value=llm):
+        with pytest.raises(ex03._IncompleteModelResponse,
+                           match="stop_reason='end_turn'"):
+            ex03._chat_once(request)
 
 
 def test_react_loop_with_fake_client():

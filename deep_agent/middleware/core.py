@@ -127,7 +127,8 @@ class ModelRequest:
     model: str
     messages: list[dict]
     tools: list[dict] = field(default_factory=list)
-    max_tokens: int = 1024
+    # thinking 也占用输出预算；默认 1024 容易在正文/工具调用前被截断。
+    max_tokens: int = 8192
     system: str | None = None          # Messages API 的顶层 system 参数
     state: dict | None = None          # 当时的 agent state（可选，供状态感知中间件读取）
 

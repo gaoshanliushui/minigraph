@@ -165,7 +165,7 @@ if __name__ == "__main__":
 
     # print_graph(app)
 
-    cfg = {"thread_id": "deep-demo5"}
+    cfg = {"thread_id": "deep-demo6"}
     one_shot = sys.argv[1] if len(sys.argv) > 1 else None
     print(f"provider={info.provider}, model={info.model}, thread={cfg['thread_id']}")
     if one_shot is None:
