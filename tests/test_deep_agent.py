@@ -343,3 +343,67 @@ def test_subagent_inherits_backend_file_middleware(tmp_path):
     assert (tmp_path / "child.txt").read_text() == "from subagent"
     assert "child done" in _results(out)["task"]
     assert out["files"] == {}
+
+
+def test_parallel_tool_calls_run_concurrently_and_keep_order():
+    """同一条回复里的多个 tool_use 并发执行（仿 LangGraph ToolNode._func），
+    但 tool_result 的顺序仍按原调用顺序，state 合并语义不变。"""
+    import time
+
+    from minigraph.tools import tool
+
+    n_calls, sleep_s = 8, 0.3
+
+    @tool
+    def slow(x: int) -> str:
+        """慢工具。"""
+        time.sleep(sleep_s)
+        return f"done-{x}"
+
+    def model(request):
+        has_result = any(
+            isinstance(m.get("content"), list)
+            and any(b.get("type") == "tool_result" for b in m["content"])
+            for m in request.messages)
+        if has_result:
+            return [_text("done")]
+        return [_call(f"c{i}", "slow", {"x": i}) for i in range(n_calls)]
+
+    app = create_deep_agent(model, tools=[slow], summarization=False)
+    t0 = time.monotonic()
+    out = app.invoke(dict(_INPUT), config={"thread_id": "parallel-tools"})
+    elapsed = time.monotonic() - t0
+
+    # 并发：远快于串行的 n_calls * sleep_s
+    assert elapsed < n_calls * sleep_s * 0.5, (
+        f"工具调用没有并发执行：{elapsed:.2f}s >= {n_calls * sleep_s * 0.5:.2f}s")
+
+    # 顺序：tool_result 按原调用顺序返回
+    results = _results(out)
+    assert list(results) == [f"c{i}" for i in range(n_calls)]
+    assert [results[f"c{i}"] for i in range(n_calls)] == [
+        f"done-{i}" for i in range(n_calls)]
+
+
+def test_parallel_tool_calls_merge_state_updates():
+    """并发写文件 / 改待办：files 浅合并，其余 last-write-wins，
+    与串行执行结果一致。"""
+    def model(request):
+        has_result = any(
+            isinstance(m.get("content"), list)
+            and any(b.get("type") == "tool_result" for b in m["content"])
+            for m in request.messages)
+        if has_result:
+            return [_text("done")]
+        return [
+            _call("a", "write_file", {"path": "/x.txt", "content": "AAA"}),
+            _call("b", "write_file", {"path": "/y.txt", "content": "BBB"}),
+            _call("c", "write_todos",
+                  {"todos": [{"content": "step", "status": "pending"}]}),
+        ]
+
+    app = create_deep_agent(model, summarization=False)
+    out = app.invoke(dict(_INPUT), config={"thread_id": "parallel-state"})
+
+    assert out["files"] == {"/x.txt": "AAA", "/y.txt": "BBB"}
+    assert out["todos"] == [{"content": "step", "status": "pending"}]

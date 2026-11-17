@@ -51,6 +51,7 @@ HumanInTheLoopMiddleware（需要 checkpointer），让主代理在指定工具�
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Annotated, Callable
 
@@ -280,26 +281,45 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
     def tool_node(state: DeepAgentState) -> dict:
         last = state["messages"][-1]
         calls = [b for b in last["content"] if b.get("type") == "tool_use"]
-        results, extra = [], {}
-        for c in calls:
-            t = registry.get(c.get("name"))
 
-            def _exec(request: ToolRequest, _t=t) -> str:
-                if _t is None:
+        def _run_one(c: dict) -> tuple[str, dict]:
+            """跑一次工具调用，返回 (给模型的文本, 本次调用产生的 state 更新)。"""
+            t = registry.get(c.get("name"))
+            upd: dict = {}
+
+            def _exec(request: ToolRequest) -> str:
+                if t is None:
                     return f"错误：未知工具 {request.name!r}"
-                if isinstance(_t, _StateTool):
-                    text, upd = _t.state_fn(state, request.args)
-                    for k, v in (upd or {}).items():
-                        if k == "files":
-                            extra.setdefault("files", {}).update(v)
-                        else:
-                            extra[k] = v
+                if isinstance(t, _StateTool):
+                    text, state_upd = t.state_fn(state, request.args)
+                    upd.update(state_upd or {})
                     return text
-                return str(_t.invoke(request.args))
+                return str(t.invoke(request.args))
 
             out = stack.tool_call(ToolRequest(c, state=state), _exec)
-            results.append({"type": "tool_result", "tool_use_id": c["id"],
-                            "content": out})
+            return out, upd
+
+        # 一次模型回复里可能有多个 tool_use；它们彼此独立，并发执行。
+        # 仿照 LangGraph ToolNode._func：解析出调用列表 -> 并发跑 -> 按原序合并。
+        if len(calls) > 1:
+            with ThreadPoolExecutor(max_workers=min(16, len(calls))) as pool:
+                futures = [pool.submit(_run_one, c) for c in calls]
+                outputs = [f.result() for f in futures]
+        else:
+            outputs = [_run_one(c) for c in calls]
+
+        # 合并 state 更新：files 浅合并，其余 last-write-wins。
+        # 按调用顺序合并，结果与串行执行一致（与执行完成顺序无关）。
+        extra: dict = {}
+        for _, upd in outputs:
+            for k, v in upd.items():
+                if k == "files":
+                    extra.setdefault("files", {}).update(v)
+                else:
+                    extra[k] = v
+
+        results = [{"type": "tool_result", "tool_use_id": c["id"], "content": out}
+                   for c, (out, _) in zip(calls, outputs)]
         return {**extra, "messages": [{"id": _mid("tool"), "role": "user",
                                        "content": results}]}
 
