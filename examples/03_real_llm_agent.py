@@ -105,6 +105,12 @@ PROVIDERS = {
         "model": "ark-code-latest",   # 也可填推理接入点 ep-xxx
         "auth": "bearer",
     },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/anthropic",
+        "key_envs": ("DEEPSEEK_API_KEY",),
+        "model": "deepseek-flash",
+        "auth": "bearer",
+    },
 }
 
 
