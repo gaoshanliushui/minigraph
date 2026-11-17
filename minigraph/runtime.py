@@ -396,8 +396,83 @@ class CompiledGraph:
         """最近一次 invoke/stream 是否因 interrupt 挂起；返回挂起时传出的 value。"""
         return getattr(self, "_interrupted", None)
 
-    def stream(self, input: State | None = None, config: dict | None = None, **kw):
-        yield from self._run(input, {**(config or {}), **kw})
+    def stream(self, input: State | None = None, config: dict | None = None,
+               *, stream_mode: str | list[str] = "updates", **kw):
+        """流式跑图。`stream_mode` 对齐 LangGraph：
+
+        - "updates"（默认）：每步产出 (node, step, update) —— 只有节点写完的
+          那些字段。同步生成器，向后兼容。
+        - "values"：每步产出**完整** state 投影。
+        - "custom"：节点里 get_stream_writer() 写出来的自定义数据（模型
+          token 就靠它实时流出）。需要后台线程跑图、队列桥接。
+        - 列表（如 ["updates", "custom"]）：同时收多种，每项是 (mode, payload)。
+
+        单模式时产出形状和原来一样（updates -> 三元组，custom -> 裸数据），
+        多模式时才带 mode 前缀。
+        """
+        cfg = {**(config or {}), **kw}
+        modes = [stream_mode] if isinstance(stream_mode, str) else list(stream_mode)
+        if "custom" not in modes:
+            # 同步路径：没有跨线程产出，直接在调用方线程跑生成器。
+            if modes == ["updates"]:
+                yield from self._run(input, cfg)
+                return
+            if modes == ["values"]:
+                for _ in self._run(input, cfg):
+                    yield dict(self._last_values)
+                return
+            raise ValueError(f"未知 stream_mode={stream_mode!r}")
+        yield from self._stream_with_custom(input, cfg, modes)
+
+    def _stream_with_custom(self, input, cfg: dict, modes: list[str]):
+        """含 custom 的流式：图在**后台线程**里跑，主线程从队列取事件。
+
+        为什么需要后台线程：模型 token 是在节点**执行过程中**产生的，
+        同步生成器要等节点跑完才会 yield 下一条 —— token 就全憋在节点里。
+        把图丢进后台线程、writer 往队列里写，主线程就能边跑边收。
+        """
+        import queue
+        import threading
+
+        events: queue.Queue = queue.Queue()
+        done = object()                       # 结束哨兵
+
+        def emit_custom(data):
+            events.put(("custom", data))
+
+        def worker():
+            # 节点里 get_stream_writer() 拿到的是这个 emit_custom。
+            _ctx()["stream_writer"] = emit_custom
+            try:
+                if "updates" in modes:
+                    for node, step, update in self._run(input, cfg):
+                        events.put(("updates", (node, step, update)))
+                elif "values" in modes:
+                    for _ in self._run(input, cfg):
+                        events.put(("values", dict(self._last_values)))
+                else:
+                    for _ in self._run(input, cfg):
+                        pass
+            except BaseException as exc:  # noqa: BLE001 —— 透传给主线程
+                events.put(("__error__", exc))
+            finally:
+                events.put(done)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            while True:
+                item = events.get()
+                if item is done:
+                    break
+                mode, payload = item
+                if mode == "__error__":
+                    raise payload
+                # 只 yield 调用方要的模式
+                if mode in modes:
+                    yield payload if len(modes) == 1 else (mode, payload)
+        finally:
+            thread.join(timeout=5)
 
     def get_state(self, config: dict) -> Checkpoint:
         thread_id = (config or {}).get("thread_id")
@@ -1473,10 +1548,12 @@ def _write_state_channels(reducers: Mapping[str, Reducer], channels: dict[str, B
 # ---------------------------------------------------------------------------
 
 def _run_task(name: str, fn: Callable, arg: Any, retry: Any, slot: str,
-              resume: dict | None = None):
-    """在一个线程里跑节点。线程本地要重新注入 slot / resume（线程池不继承调用方上下文）。"""
+              resume: dict | None = None, stream_writer: Any = None):
+    """在一个线程里跑节点。线程本地要重新注入 slot / resume / writer
+    （线程池不继承调用方上下文）。"""
     _ctx()["slot"] = slot
     _ctx()["resume"] = dict(resume or {})
+    _ctx()["stream_writer"] = stream_writer
     try:
         return _run_with_retry(name, fn, arg, retry)
     except GraphInterrupt as gi:
@@ -1497,18 +1574,21 @@ def _execute_batch(nodes: dict[str, NodeSpec], runs, snapshot: dict):
 
     # 恢复值必须显式带进工作线程：threading.local 不会被线程池继承
     resume = dict(_ctx().get("resume") or {})
+    # stream_writer 同理：节点里的 get_stream_writer() 要能拿到它。
+    writer = _ctx().get("stream_writer")
 
     if len(runs) == 1:
         (task, slot), = runs
         spec = nodes[task.name]
-        return [_run_task(task.name, spec.fn, arg_for(task), spec.retry, slot, resume)]
+        return [_run_task(task.name, spec.fn, arg_for(task), spec.retry, slot,
+                          resume, writer)]
 
     with ThreadPoolExecutor(max_workers=min(16, len(runs))) as pool:
         futures = []
         for (task, slot) in runs:
             spec = nodes[task.name]
             futures.append(pool.submit(_run_task, task.name, spec.fn, arg_for(task),
-                                       spec.retry, slot, resume))
+                                       spec.retry, slot, resume, writer))
         return [f.result() for f in futures]
 
 

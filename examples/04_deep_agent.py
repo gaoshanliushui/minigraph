@@ -89,13 +89,42 @@ def run_turn(app, cfg: dict, question: str) -> dict:
     }]}
     run_cfg = cfg
     while True:
-        for node, step, update in app.stream(run_input, config=run_cfg):
+        # 双模式流式：custom 拿模型 token（实时打印），updates 拿节点更新。
+        streaming = False              # 是否正在一段 token 输出里
+        for mode, payload in app.stream(
+            run_input, config=run_cfg, stream_mode=["updates", "custom"],
+        ):
+            if mode == "custom":
+                if not streaming:
+                    print("  模型 | ", end="", flush=True)
+                    streaming = True
+                print(payload.get("text", ""), end="", flush=True)
+                continue
+            if streaming:               # token 段落结束，补换行
+                print()
+                streaming = False
+            node, step, update = payload
             for message in update.get("messages", []):
-                print(f"  step {step} | {node:<28} | {ex03._brief(message)}")
+                # token 已经实时打印过了，这里只报工具调用 / 工具结果，
+                # 避免把 assistant 正文再打印一遍。
+                for b in (message.get("content") or []):
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("type") == "tool_use":
+                        print(f"  step {step} | {node:<28} | "
+                              f"[调用 {b['name']}({json.dumps(b.get('input', {}), ensure_ascii=False)})]")
+                    elif b.get("type") == "tool_result":
+                        body = b.get("content")
+                        text = body if isinstance(body, str) else json.dumps(
+                            body, ensure_ascii=False, default=str)
+                        print(f"  step {step} | {node:<28} | "
+                              f"[工具结果 {len(text)} 字符]")
             if "todos" in update:
                 for todo in update["todos"]:
                     print(f"           todo [{todo.get('status')}] "
                           f"{todo.get('content')}")
+        if streaming:
+            print()
 
         pending = app.interrupted
         if pending is None:

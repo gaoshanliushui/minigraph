@@ -104,15 +104,45 @@ class _Block:
         return dict(self._fields)
 
 
+class _FakeStream:
+    """模拟 SDK 的 MessageStream：text_stream 逐段吐文本，get_final_message 汇总。
+
+    形状对齐真 SDK：text_stream 只吐 text block 的文字（tool_use 没有文字）；
+    get_final_message 返回带 .content 的对象，content 是带 model_dump 的 block。
+    """
+
+    def __init__(self, blocks):
+        self._blocks = blocks
+        self.text_stream = iter(
+            b["text"] for b in blocks if b.get("type") == "text"
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get_final_message(self):
+        return SimpleNamespace(
+            content=[_Block(**b) for b in self._blocks])
+
+
 class _FakeMessages:
     def __init__(self, responses):
         self._responses = list(responses)
-        self.calls = []                     # 每次 create 的 kwargs，供断言请求体
+        self.calls = []                     # 每次调用的 kwargs，供断言请求体
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
         assert self._responses, "fake client 的响应用完了（回环次数超预期）"
         return SimpleNamespace(content=[_Block(**b) for b in self._responses.pop(0)])
+
+    def stream(self, **kwargs):
+        # 示例的 _chat_once 现在走流式接口；复用同一份响应脚本。
+        self.calls.append(kwargs)
+        assert self._responses, "fake client 的响应用完了（回环次数超预期）"
+        return _FakeStream(self._responses.pop(0))
 
 
 class _FakeClient:

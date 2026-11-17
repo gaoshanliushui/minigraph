@@ -40,6 +40,12 @@ anthropic SDK 就够，不需要为每家写转换层。端点/模型名如有�
 消息格式：内部直接用 **Anthropic 原生消息**（role + content blocks），
 只在消息级多挂一个 `id` 给 add_messages（按 id 追加/更新）；调 API 前
 把消息级 id 剥掉。tool_use / tool_result 靠 block 里的 id 配对，原样回传。
+
+流式输出：`_chat_once` 用 SDK 的 `messages.stream()`，每个 token 经
+minigraph 的 `get_stream_writer()` 实时写出去（对齐 LangGraph 的
+custom 模式）。主循环用 `stream_mode=["updates", "custom"]`：custom
+收 token 实时打印，updates 收工具调用 / 结果。没开 custom 模式时
+writer 是 no-op，行为等价于一次性调用。
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ from dotenv import load_dotenv
 from minigraph.builder import StateGraph
 from minigraph.checkpoint_sqlite import SqliteSaver
 from minigraph.constants import END
+from minigraph.context import get_stream_writer
 from deep_agent.middleware import (
     MiddlewareStack,
     ModelRequest,
@@ -217,15 +224,30 @@ STACK = MiddlewareStack([LogCalls, retry_model, tool_guard])
 
 # ---------------------------------------------------------------- LLM 调用
 def _chat_once(request: ModelRequest) -> list[dict]:
-    """真正发 HTTP 的一层（中间件链的最内层 handler）。"""
+    """真正发 HTTP 的一层（中间件链的最内层 handler）。
+
+    用 SDK 的**流式**接口：text_stream 逐 token 送出来，经
+    get_stream_writer() 写到 stream(stream_mode="custom") 的消费者。
+    最后用 get_final_message() 拿完整累积的 Message —— 存进 state 的
+    content blocks 和一次性 create() 的结果形状完全一致，checkpoint /
+    历史回传的逻辑不用动。
+
+    没开 custom 模式时 get_stream_writer() 是 no-op，token 照常累积，
+    行为等价于一次性调用（只是多花了流式的解析开销）。
+    """
     kwargs = {"system": request.system} if request.system else {}
-    resp = _get_llm().client.messages.create(
+    writer = get_stream_writer()
+    with _get_llm().client.messages.stream(
         model=request.model,
         max_tokens=request.max_tokens,
         messages=request.messages,
         tools=request.tools,
         **kwargs,
-    )
+    ) as stream:
+        for text in stream.text_stream:
+            # 每个 token 立即送出去；消费者拿到的是纯文本片段。
+            writer({"type": "token", "text": text})
+        resp = stream.get_final_message()
     # block 对象 model_dump() 成 dict：checkpoint 走 JSON 序列化（存不了
     # pydantic 对象），下一轮回传 API 和 add_messages 合并也都用 dict。
     return [block.model_dump() for block in resp.content]
@@ -380,9 +402,29 @@ if __name__ == "__main__":
 
     user_input = {"messages": [{"id": _new_id("h"), "role": "user", "content": question}]}
 
-    for node, step, update in app.stream(user_input, config=cfg):
+    # 双模式流式：
+    #   custom  —— 模型 token 一到就打印（不换行，实时"打字"效果）
+    #   updates —— 节点写完的结构化更新（工具调用、工具结果等）
+    # 一个 token 事件也不落的话，还能退回原来的按步打印。
+    streaming = False          # 当前是否在一段 token 输出里（决定是否要换行）
+    for mode, payload in app.stream(
+        user_input, config=cfg, stream_mode=["updates", "custom"],
+    ):
+        if mode == "custom":
+            if not streaming:
+                print("  模型 | ", end="", flush=True)
+                streaming = True
+            print(payload.get("text", ""), end="", flush=True)
+            continue
+        # 一段 token 输出结束，补上换行再打印结构化更新
+        if streaming:
+            print()
+            streaming = False
+        node, step, update = payload
         for m in update.get("messages", []):
             print(f"  step {step} | {node:<6} | {_brief(m)}")
+    if streaming:
+        print()
 
     final = app.get_state(cfg).values["messages"]
     print(f"\n本 thread 共 {len(final)} 条消息；最后一条：")
