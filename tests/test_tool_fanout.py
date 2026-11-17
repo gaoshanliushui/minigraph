@@ -1,4 +1,4 @@
-"""工具调用并行扇出（对齐 LangGraph 的 Send("tools", [tool_call])）。"""
+"""工具调用并行（对齐 LangGraph ToolNode._func 的线程池执行与按序合并）。"""
 
 import threading
 import time
@@ -46,7 +46,7 @@ def _tool_messages(out):
 
 
 def test_parallel_tool_calls_run_concurrently_and_keep_call_order():
-    """N 个工具调用 = N 个并行 task；结果按原调用顺序拼成一条消息。"""
+    """N 个工具调用在线程池里并行；结果按原调用顺序拼成一条消息。"""
     barrier = threading.Barrier(3, timeout=5)
     threads = []
 
@@ -188,7 +188,7 @@ def test_already_answered_tool_calls_are_not_dispatched_again():
 
 
 def test_tool_node_runs_once_per_call():
-    """每个工具调用恰好执行一次（一个 task 一次调用）。"""
+    """每个工具调用恰好执行一次（每次派发只调用一次）。"""
     counts = {}
 
     @tool
@@ -349,3 +349,36 @@ def test_hitl_per_call_reject_does_not_execute_the_tool():
     rejected = [v for k, v in results.items() if k == first]
     assert rejected and "不批" in rejected[0]
     assert len(_tool_messages(out)) == 1
+
+
+def test_interrupt_inside_parallel_tool_bubbles_and_resumes():
+    """工具线程里的 interrupt 找回图任务上下文，也不会被异常兜底吞掉。"""
+    from minigraph.checkpoint import InMemorySaver
+    from minigraph.context import interrupt
+
+    @tool
+    def ask_human(question: str) -> str:
+        """把问题交给人工，并返回人工答复。"""
+        return interrupt({"type": "question", "question": question})
+
+    @tool
+    def echo(text: str) -> str:
+        """回显文本。"""
+        return text
+
+    model = FakeModel([
+        [_call("q", "ask_human", {"question": "怎么继续"}),
+         _call("e", "echo", {"text": "parallel"})],
+        [_text("done")],
+    ])
+    app = create_deep_agent(
+        model, tools=[ask_human, echo], checkpointer=InMemorySaver())
+    cfg = {"thread_id": "interrupt-inside-tool"}
+
+    app.invoke({"messages": [{"id": "h1", "role": "user", "content": "go"}]},
+               config=cfg)
+    assert app.interrupted == {"type": "question", "question": "怎么继续"}
+
+    out = app.invoke(None, config={**cfg, "resume": "人工答复"})
+    assert app.interrupted is None
+    assert _results(out) == {"q": "人工答复", "e": "parallel"}

@@ -48,6 +48,7 @@ PUSH 任务**不走触发判定**（目标节点的 versions_seen 保持为空�
 
 from __future__ import annotations
 
+import itertools
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -957,8 +958,8 @@ class CompiledGraph:
             # 不这么做的话，有副作用的工具会被执行两次。
             runs, reused = self._split_reused(all_runs, rt)
 
-            # 本超步开始前的 resume 队列快照。挂起时整步回滚，已经被
-            # 消费掉的 resume 值必须还原 —— 否则重跑时取不到。
+            # 本超步使用的 resume 列表快照。interrupt() 只按索引读取、
+            # 不消费；挂起时原样保存，节点重跑才能按相同序号重放旧答复。
             store_before = {k: list(v) for k, v in (_ctx().get("resume") or {}).items()}
             results = _execute_batch(self.nodes, runs, snapshot)
 
@@ -1324,7 +1325,7 @@ class _NodeError:
 def _merge_resume(store: dict[str, list[Any]], pending: list[dict[str, Any]],
                   value: Any) -> dict[str, list[Any]]:
     """
-    把用户带来的 resume 值并进"槽位 -> 值队列"。
+    把用户带来的 resume 值并进"槽位 -> 按序值列表"。
 
     `value` 有三种形态：
 
@@ -1345,8 +1346,8 @@ def _merge_resume(store: dict[str, list[Any]], pending: list[dict[str, Any]],
     代价是有一个歧义：payload 的键**恰好**叫某个待恢复节点名时，
     按扩展解释（键 = 节点名）。这是有意取舍 —— 扩展是文档化的一等公民。
 
-    队列而不是单值：整步回滚会让节点重跑，已经答复过的值必须留着；
-    一个节点多次 interrupt() 时也要按调用顺序逐个取。
+    列表而不是单值：整步回滚会让节点重跑，已经答复过的值必须留着；
+    一个任务多次 interrupt() 时按任务内的调用序号读取，不按序出队。
     """
     if isinstance(value, Mapping):
         # 只有键真的对得上某个待恢复的节点/槽位，才按"批量答复"解释。
@@ -1358,11 +1359,11 @@ def _merge_resume(store: dict[str, list[Any]], pending: list[dict[str, Any]],
                 targets = [p for p in pending if p["slot"] == key] or \
                           [p for p in pending if p["node"] == key]
                 for p in targets:
-                    queue = store.setdefault(p["slot"], [])
+                    answers = store.setdefault(p["slot"], [])
                     if isinstance(val, (list, tuple)):
-                        queue.extend(val)
+                        answers.extend(val)
                     else:
-                        queue.append(val)
+                        answers.append(val)
             return store
         # 键对不上 -> 整个字典是一个答复值，原样透传给 interrupt()
     for p in pending:
@@ -1553,6 +1554,9 @@ def _run_task(name: str, fn: Callable, arg: Any, retry: Any, slot: str,
     （线程池不继承调用方上下文）。"""
     _ctx()["slot"] = slot
     _ctx()["resume"] = dict(resume or {})
+    # 每次执行（包括 interrupt 后的整节点重跑）都从零编号；节点内部
+    # 再派工具线程时共享这个计数器，对齐 LangGraph 的任务级 scratchpad。
+    _ctx()["interrupt_counter"] = itertools.count()
     _ctx()["stream_writer"] = stream_writer
     try:
         return _run_with_retry(name, fn, arg, retry)

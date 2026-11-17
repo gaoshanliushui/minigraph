@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import itertools
 import threading
 from typing import Any, Callable
 
@@ -16,7 +17,12 @@ _CTX = threading.local()
 def _ctx() -> dict[str, Any]:
     """每次运行（一次 invoke / resume）一份上下文，供 interrupt() 读取。"""
     if not hasattr(_CTX, "data"):
-        _CTX.data = {"resume": {}, "slot": None, "stream_writer": None}
+        _CTX.data = {
+            "resume": {},
+            "slot": None,
+            "interrupt_counter": None,
+            "stream_writer": None,
+        }
     return _CTX.data
 
 
@@ -56,15 +62,28 @@ def interrupt(value: Any) -> Any:
     恢复时直接用掉（对齐 LangGraph 的 `_reapply_writes_to_succeeded_nodes`）。
     也就是说，只有**调用 interrupt() 的那个节点**需要幂等。
 
-    resume 值按**槽位**存放，一个槽位是一个队列：
+    resume 值按**槽位**存放，一个槽位对应一个列表：
       - 多个节点并行挂起：每个节点一个槽位，各拿各的值
-      - 一个节点里多次 interrupt()：同一个槽位多个值，按调用顺序出队
-    队列空了说明这个挂起点还没被答复 -> 挂起。
+      - 一个任务里多次 interrupt()：按任务内的调用序号读取 resume[idx]
+
+    列表只读、不按索引消费。节点挂起后会从头重跑，计数器也从零开始，
+    于是前几个 interrupt() 会依次重放已经收到的答复；走到第一个还没有
+    答复的序号才再次挂起。对齐 LangGraph 的 scratchpad.interrupt_counter()
+    + scratchpad.resume[idx]。工具线程池里的子调用共享父图任务的计数器和
+    答复列表，因此作用域仍是整个图任务，而不是各自独立的小任务。
     """
-    slot = _ctx().get("slot")
+    ctx = _ctx()
+    slot = ctx.get("slot")
     if slot is None:
         raise RuntimeError("interrupt() 只能在图节点内调用")
-    queue = _ctx()["resume"].get(slot)
-    if queue:
-        return queue.pop(0)        # 队首出队
+    counter = ctx.get("interrupt_counter")
+    if counter is None:
+        # 兼容直接把 slot/resume 注入上下文的调用方；正常图任务由运行时
+        # 在 _run_task 里创建计数器。
+        counter = itertools.count()
+        ctx["interrupt_counter"] = counter
+    idx = next(counter)
+    resumes = ctx["resume"].get(slot) or []
+    if idx < len(resumes):
+        return resumes[idx]
     raise GraphInterrupt(value)

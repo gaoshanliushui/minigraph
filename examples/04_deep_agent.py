@@ -117,8 +117,8 @@ def run_turn(app, cfg: dict, question: str) -> dict:
                         body = b.get("content")
                         text = body if isinstance(body, str) else json.dumps(
                             body, ensure_ascii=False, default=str)
-                        print(f"  step {step} | {node:<28} | "
-                              f"[工具结果 {len(text)} 字符]")
+                        # print(f"  step {step} | {node:<28} | "
+                        #       f"[工具结果 {len(text)} 字符]")
             if "todos" in update:
                 for todo in update["todos"]:
                     print(f"           todo [{todo.get('status')}] "
@@ -165,7 +165,7 @@ if __name__ == "__main__":
 
     # print_graph(app)
 
-    cfg = {"thread_id": "deep-demo3"}
+    cfg = {"thread_id": "deep-demo5"}
     one_shot = sys.argv[1] if len(sys.argv) > 1 else None
     print(f"provider={info.provider}, model={info.model}, thread={cfg['thread_id']}")
     if one_shot is None:
@@ -191,8 +191,8 @@ if __name__ == "__main__":
             break
 
         values = run_turn(app, cfg, question)
-        print("\n助手：", ex03._brief(values["messages"][-1]))
-        print(f"[本 thread 已保存 {len(values['messages'])} 条消息]")
+        # print("\n助手：", ex03._brief(values["messages"][-1]))
+        # print(f"[本 thread 已保存 {len(values['messages'])} 条消息]")
 
         if one_shot is not None:
             break

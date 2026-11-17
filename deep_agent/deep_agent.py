@@ -57,6 +57,7 @@ from typing import Annotated, Callable
 
 from minigraph.builder import StateGraph
 from minigraph.constants import END
+from minigraph.context import GraphInterrupt, _ctx
 from minigraph.state import DeltaChannel, State, add_messages, merge_dict
 from minigraph.tools import Tool, tool
 
@@ -192,6 +193,10 @@ def _tool_guard(request, handler):
     """默认最内层兜底：工具异常变成错误文本回给模型。"""
     try:
         return handler(request)
+    except GraphInterrupt:
+        # 对齐 ToolNode 的 GraphBubbleUp：审批/恢复不是工具错误，必须冒泡
+        # 给图运行时，不能转成一段 tool_result 文本吞掉。
+        raise
     except Exception as e:
         return f"工具执行失败: {e}"
 
@@ -282,8 +287,18 @@ def _build_agent(model, registry: dict[str, Tool], prompt: str,
         last = state["messages"][-1]
         calls = [b for b in last["content"] if b.get("type") == "tool_use"]
 
+        # 对齐 ToolNode._func 在派发前为每个调用准备 config/ToolRuntime：
+        # 二级线程池不会继承 threading.local，必须显式恢复图任务上下文。
+        # interrupt_counter 和 resume 列表是**共享引用**，所以同一 ToolNode
+        # 内的审批仍属于同一个图任务，按 interrupt() 的全局调用序号匹配。
+        task_context = {
+            key: _ctx().get(key)
+            for key in ("slot", "resume", "interrupt_counter", "stream_writer")
+        }
+
         def _run_one(c: dict) -> tuple[str, dict]:
             """跑一次工具调用，返回 (给模型的文本, 本次调用产生的 state 更新)。"""
+            _ctx().update(task_context)
             t = registry.get(c.get("name"))
             upd: dict = {}
 

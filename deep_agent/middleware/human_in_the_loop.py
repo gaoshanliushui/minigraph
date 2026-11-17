@@ -16,8 +16,10 @@ minigraph 的 interrupt() 实现：图挂起，调用方拿到一份"待审清�
                  答复是一个 {"decisions": [...]}，按顺序和清单对应
     "per_call"  每个被拦的调用各挂起一次，答复是单个决定
 
-batched 是默认；per_call 的语义更清楚（一次只做一个决定），
-但答复要按 interrupt id 配对，实现也更绕。
+batched 是默认；per_call 的语义更清楚（一次只做一个决定），也不需要
+调用方手工配对 interrupt id：同一审批任务按 interrupt() 的调用顺序
+记录并逐个重放答复。全部决定收齐后才并行执行工具，避免后续审批导致
+已批准工具重复执行。
 
 用法：
 
@@ -271,7 +273,7 @@ class HumanInTheLoopMiddleware(Middleware):
             f"意外的人工决定：{decision}。决定类型 {dtype!r} 不在工具 "
             f"{tool_call.get('name')!r} 的允许列表里（允许：{allowed}）")
 
-    # -- batched 模式：after_model 挂起 -----------------------------------
+    # -- 人工审批：after_model 挂起 ----------------------------------------
 
     def _clear_decisions(self, state) -> dict | None:
         """新一轮没有待审调用时，清掉上一轮的决定，避免 id 复用误伤。"""
@@ -283,14 +285,16 @@ class HumanInTheLoopMiddleware(Middleware):
         """
         模型返回后，检查它要调的工具里有没有被关卡拦住的。
 
-        batched 模式在这一步挂起，恢复后只把决定按 tool_call id 写进
-        state。真正的放行、替换或拒绝都在 wrap_tool_call 里完成，因此
-        不需要改写 assistant 消息，也不会绕过工具节点。
-        """
-        if self.interrupt_mode == "per_call":
-            # per_call 模式在 wrap_tool_call 里逐个挂起
-            return self._clear_decisions(state)
+        batched 模式在这一步一次性挂起；per_call 模式在这里按调用顺序
+        逐个挂起。恢复后只把决定按 tool_call id 写进 state。真正的放行、
+        替换或拒绝都在 wrap_tool_call 里完成，因此不需要改写 assistant
+        消息，也不会绕过工具节点。
 
+        per_call 不在并行工具线程里等待后续审批：ToolNode 没返回前，已经
+        完成的子调用结果无法提交；若另一个调用挂起，整个工具节点重跑会把
+        已批准的工具再执行一次。先收齐并提交决定，再并行执行，既保留
+        一次只问一个的交互，也避免这种重复副作用。
+        """
         messages = state.get("messages") or []
         if not messages:
             return self._clear_decisions(state)
@@ -323,7 +327,25 @@ class HumanInTheLoopMiddleware(Middleware):
         if not action_requests:
             return self._clear_decisions(state)
 
-        # 挂起：这一行的返回就是给调用方看的待审清单
+        if self.interrupt_mode == "per_call":
+            # 同一任务内按 interrupt() 调用序号匹配答复。节点重跑时，前面的
+            # interrupt() 重放旧决定，只有第一个未答复的调用会再次挂起。
+            recorded: dict[str, dict[str, Any]] = {}
+            for call, action_request in zip(gated_calls, action_requests):
+                value: ToolApprovalRequest = {
+                    "type": "tool_approval",
+                    "tool_call_id": call["id"],
+                    "name": call.get("name", ""),
+                    "args": call.get("input", {}) or {},
+                    "description": action_request["description"],
+                }
+                decision = interrupt(value)
+                self._process_decision(
+                    decision, call, self.interrupt_on[call["name"]])
+                recorded[call["id"]] = decision
+            return {_DECISIONS_KEY: recorded}
+
+        # batched：一次挂起，这一行的返回就是给调用方看的待审清单
         hitl_request: HITLRequest = {
             "action_requests": action_requests,
             "review_configs": review_configs,
@@ -390,7 +412,7 @@ class HumanInTheLoopMiddleware(Middleware):
                 result = {**result, "content": [notice, *(content or [])]}
         return result
 
-    # -- per_call 模式：wrap_tool_call 挂起 --------------------------------
+    # -- per_call 兼容路径：未接 after_model 时在 wrap_tool_call 挂起 --------
 
     def _resolve_per_call(self, request: ToolRequest) -> tuple[ToolRequest, Action | None] | dict:
         """
@@ -432,7 +454,10 @@ class HumanInTheLoopMiddleware(Middleware):
 
     def wrap_tool_call(self, request: ToolRequest, handler):
         """执行前过一遍关卡；被拒绝的调用绝不会进入 handler。"""
-        if self.interrupt_mode == "per_call":
+        decision = self._reviewer_decision(request)
+        if decision is None and self.interrupt_mode == "per_call":
+            # 兼容没把 after_model 接进图的自定义组装：正常 create_agent /
+            # create_deep_agent 已在 after_model 收齐决定，不会走这里。
             resolved = self._resolve_per_call(request)
             if isinstance(resolved, dict):
                 # 工具 handler 的返回值最终成为 tool_result.content，故这里
@@ -441,7 +466,6 @@ class HumanInTheLoopMiddleware(Middleware):
             to_run, executed = resolved
             return self._prepend_notice(handler(to_run), executed)
 
-        decision = self._reviewer_decision(request)
         if decision is None:
             return handler(request)
 

@@ -97,9 +97,9 @@ class Checkpoint:
     # 恢复时按节点名或槽位给值，可以一次把几个都答复掉。
     interrupts: list[dict[str, Any]] = field(default_factory=list)
 
-    # 已收集到的 resume 值：槽位 -> 值队列。
+    # 已收集到的 resume 值：槽位 -> 按序值列表。
     #   - 多个节点同时挂起：每个槽位各有一个值
-    #   - 一个节点里多次 interrupt()：同一个槽位有多个值，按调用顺序出队
+    #   - 一个任务里多次 interrupt()：同一个槽位有多个值，按 interrupt 序号读取
     # 整步回滚意味着挂起的节点会重跑，所以这些值必须**跨 resume 累积保存**，
     # 否则重跑时取不到已经答复过的那个。
     resumes: dict[str, list[Any]] = field(default_factory=dict)
